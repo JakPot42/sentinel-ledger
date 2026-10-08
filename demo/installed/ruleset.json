@@ -1,0 +1,8 @@
+{
+  "ruleset_id": "conveyor-rules-1",
+  "kind": "declared",
+  "rules": [
+    {"id": "R1-light-curtain", "type": "block_when", "input": "light_curtain_clear", "op": "eq", "value": 0},
+    {"id": "R2-speed-limit", "type": "clamp", "field": "speed_mm_s", "min": 0, "max": 1500}
+  ]
+}

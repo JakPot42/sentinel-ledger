@@ -1,0 +1,30 @@
+[package]
+name = "sentinel-recorder"
+version = "0.1.0"
+edition = "2024"
+description = "Sentinel Ledger recorder: writes a record for every actuator command before forwarding it"
+
+[lib]
+name = "sentinel_recorder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sentinel-recorder"
+path = "src/main.rs"
+
+[dependencies]
+# Hashing, the journal format and inclusion proofs come from LogChain unchanged.
+logchain = { git = "https://github.com/JakPot42/logchain", rev = "b6ae3f3fd6392bc309d0652325e79e6c8ed654f6" }
+serde_json = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+# Each feature plants one deliberate bug. They exist only so tests/test_planted_bugs.py
+# can show the verifier and the actuator check turn red. Never enable one in a real build.
+[features]
+planted-bug-clamp-bound = []
+planted-bug-skip-block = []
+planted-bug-stale-in-force = []
+planted-bug-forward-first = []
+planted-bug-forward-and-ignore-failed-write = []
+planted-bug-no-heartbeat = []

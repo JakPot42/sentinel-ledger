@@ -1,0 +1,5 @@
+* text=auto eol=lf
+# Hashed by their bytes. Git must not rewrite line endings in them.
+sources/** -text
+demo/installed/** -text
+demo/changes/** -text

@@ -1,0 +1,63 @@
+{
+  "profile_schema": "sentinel-ledger/profile/0",
+  "profile_id": "eu-2023-1230-annex-iii",
+  "status": "A mapping from three provisions to records. It is not a statement that any machine conforms to the regulation.",
+  "source": {
+    "title": "Regulation (EU) 2023/1230 of the European Parliament and of the Council of 14 June 2023 on machinery",
+    "published": "OJ L 165, 29.6.2023, p. 1",
+    "retrieved": "2026-10-08",
+    "url": "http://publications.europa.eu/resource/celex/32023R1230",
+    "file": "sources/eu/32023R1230_OJ_L165_2023-06-29_en.xhtml",
+    "sha256": "45172093d5547c21c9f7d5da2628e5c630b5e7e586e163aff6b7c936ded17b48",
+    "corrigendum": {
+      "published": "OJ L 169, 4.7.2023, p. 35",
+      "retrieved": "2026-10-08",
+      "url": "http://publications.europa.eu/resource/celex/32023R1230R(01)",
+      "file": "sources/eu/32023R1230R01_OJ_L169_2023-07-04_en.xhtml",
+      "sha256": "8ccfcc43b3a86d102bc711d4f2c14d3be44ae2c2d8cb3e32e44d2bb933f44bf8",
+      "effect": "Item 10 changes Article 54, second paragraph, from 14 January 2027 to 20 January 2027. No item changes Annex III."
+    },
+    "applies_from": "2027-01-20"
+  },
+  "provisions": [
+    {
+      "id": "A",
+      "citation": "Annex III, Part B, 1.1.9, fifth paragraph",
+      "text": [
+        "The machinery or related product shall collect evidence of a legitimate or illegitimate intervention in the software or a modification of the software installed on the machinery or related product or its configuration."
+      ],
+      "record_kinds": ["genesis", "intervention_declared", "intervention_detected"],
+      "retention": null,
+      "reading": "This project's reading: recording both declared changes and changes found by measurement covers 'legitimate or illegitimate'. The recorder does not decide which word applies to a change.",
+      "not_mapped": [
+        "1.1.9, second paragraph, second sentence (intervention in a hardware component): the recorder measures files and records nothing about hardware"
+      ],
+      "not_mapped_text": [
+        "The machinery or related product shall collect evidence of a legitimate or illegitimate intervention in that hardware component, when relevant for connection or access to software that is critical for the compliance of the machinery or related product."
+      ]
+    },
+    {
+      "id": "B",
+      "citation": "Annex III, Part B, 1.2.1, second paragraph, point (f)",
+      "text": [
+        "the tracing log of the data generated in relation to an intervention and of the versions of safety software uploaded after the machinery or related product has been placed on the market or put into service is enabled for five years after such upload, exclusively to demonstrate the conformity of the machinery or related product with this Annex further to a reasoned request from a competent national authority."
+      ],
+      "record_kinds": ["genesis", "intervention_declared", "intervention_detected"],
+      "retention": {"years": 5, "counted_from": "at", "applies_to": "software_version_records"},
+      "purpose": "exclusively to demonstrate the conformity of the machinery or related product with this Annex further to a reasoned request from a competent national authority",
+      "reading": "This project's reading: 'enabled for five years after such upload' means the records about an upload must still be present and verifiable five years after it. Every command record also names the state in force, which ties each command to a software version."
+    },
+    {
+      "id": "C",
+      "citation": "Annex III, Part B, 1.2.1, third paragraph, point (b)",
+      "text": [
+        "recording of data on the safety related decision-making process for software based safety systems ensuring safety function including safety components, after the machinery or related product has been placed on the market or put into service, is enabled and that such data is retained for one year after its collection, exclusively to demonstrate the conformity of the machinery or related product with this Annex further to a reasoned request from a competent national authority;"
+      ],
+      "applies_when": "Control systems of machinery or related products with fully or partially self-evolving behaviour or logic that are designed to operate with varying levels of autonomy shall be designed and constructed in such a way that:",
+      "record_kinds": ["command"],
+      "retention": {"years": 1, "counted_from": "at", "applies_to": "decision_files"},
+      "purpose": "exclusively to demonstrate the conformity of the machinery or related product with this Annex further to a reasoned request from a competent national authority",
+      "reading": "This project's reading: the decision file a command record names is the 'data on the safety related decision-making process'. What goes in it is the integrator's choice."
+    }
+  ]
+}
