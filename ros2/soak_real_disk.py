@@ -16,6 +16,8 @@ What it reports:
     median, the 99th percentile, the longest, how many over 0.5 s and over the threshold;
   - storage_stall records the recorder wrote, and the durations they state;
   - deadman trips on the robot's side, and commands the gate refused for their age;
+  - the gate's receipts as the journals hold them: how many, what they say, and how many
+    of the robot's refusals for age and deadman trips have a receipt in the journal;
   - verifier findings per scenario, and how many scenarios were not as the pass/fail
     run expects;
   - the independent clock watchdog (ros2/clock_watchdog.py): its largest step, which says
@@ -74,7 +76,7 @@ def main(argv=None):
     with open(os.path.join(HERE, "installed", "config.json"), encoding="utf-8") as fh:
         threshold_ms = 2 * json.load(fh)["heartbeat_seconds"] * 1000
 
-    rounds, findings, stalls = [], collections.Counter(), []
+    rounds, findings, stalls, receipts = [], collections.Counter(), [], collections.Counter()
     deadman_trips = stale_commands = unexpected = scenarios_run = 0
     started = time.monotonic()
     try:
@@ -104,6 +106,9 @@ def main(argv=None):
                             if record.get("kind") == "storage_stall":
                                 stalls.append({"round": number, "scenario": int(name), "step": record["step"],
                                                "stalled_ms": record["stalled_ms"]})
+                            if record.get("kind") == "gate_receipt":
+                                said = record["receipt"]
+                                receipts[said["decision"] + (":" + said["reason"] if said["reason"] else "")] += 1
                     with open(os.path.join(where, "robot_side", "actuator.jsonl"), encoding="utf-8") as fh:
                         whys = [json.loads(line).get("why") for line in fh]
                     deadman_trips += whys.count("deadman")
@@ -153,6 +158,7 @@ def main(argv=None):
         "longest_waits_between_records_s": [round(w, 3) for w in sorted(waits, reverse=True)[:5]],
         "waits_between_records_over_threshold": sum(w * 1000 > threshold_ms for w in waits),
         "storage_stall_records": stalls, "deadman_trips": deadman_trips, "stale_commands_refused": stale_commands,
+        "gate_receipts_in_the_journals": dict(sorted(receipts.items())),
         "verifier_findings": dict(sorted(findings.items())),
         "scenarios_not_as_the_pass_fail_run_expects": unexpected, "per_round": rounds,
         "watchdog": {"lines": len(clock_rows), "largest_step_s": round(max(clock_steps), 3) if clock_steps else None,
@@ -173,7 +179,11 @@ def main(argv=None):
           % (len(stalls), [s["stalled_ms"] for s in stalls] if stalls else ""))
     print("  deadman trips on the robot: %d (scenario 10 causes one in every round on purpose)" % deadman_trips)
     print("  commands the gate refused for their age: %d" % stale_commands)
-    print("  verifier findings (scenarios 5 and 10 each expect one HEARTBEAT_GAP per round, 12 expects ANCHOR_FAILED):")
+    print("  the gate's receipts in the journals: %d %s" % (sum(receipts.values()), dict(sorted(receipts.items()))))
+    print("    of the %d refusals for age the robot logged, %d have a receipt in a journal; of the %d deadman trips, %d"
+          % (stale_commands, receipts["refused:age"], deadman_trips, receipts["deadman"]))
+    print("  verifier findings (expected every round: HEARTBEAT_GAP in scenarios 5 and 10, GATE_DEADMAN in 10,")
+    print("  GATE_REFUSED in 6 to 9, ANCHOR_FAILED in 12; anything else is the disk):")
     for name, count in sorted(findings.items()):
         print("    %-34s %d" % (name, count))
     print("  scenarios not as the pass/fail run expects: %d of %d" % (unexpected, scenarios_run))

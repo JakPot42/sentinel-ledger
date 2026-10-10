@@ -51,6 +51,8 @@ Two programs, as in LogChain and asof-gate:
 | journal | the file of records, in LogChain journal format version 2 |
 | root | the Merkle root over the journal, as LogChain defines it |
 | safe-state action | what the recorder sends to the actuator when it cannot record (section 4) |
+| gate | the check on the actuator's side that passes a command on only inside a valid record (section 4.2) |
+| gate receipt | the gate's signed statement of what it did with a record or a message (section 4.5). Not the receipt of section 7.3, which is a proof that a record is in the journal |
 
 ## 3. Where the recorder sits
 
@@ -126,7 +128,7 @@ For each message the gate checks that:
 
 - the hash is `SHA-256(0x00 || record text)`;
 - the record is signed by the recorder (section 7.6). The gate holds the recorder's
-  public key and nothing that could sign;
+  public key and nothing that could sign a record;
 - the record's `n` is one more than the last accepted, and its `prev` is the last accepted
   hash. The first record it ever accepts must be a genesis record;
 - a command record's outcome and applied command agree in form.
@@ -141,6 +143,9 @@ Then:
 
 The safe-state action is set on the gate's side. The gate does not take it from the
 recorder.
+
+What the gate did with each record goes back to the recorder as a signed receipt and into
+the journal, when the gate has a key of its own. That is section 4.5.
 
 **What this enforces.** No command reaches the actuator unless it arrives inside a record
 that the recorder signed and that extends the chain the gate has seen. A command with no
@@ -244,7 +249,8 @@ When a command record arrives, the gate takes its own wall clock and subtracts
 **The record is still taken into the chain.** It is a genuine, signed record and the
 recorder's later records name it as their predecessor. If the gate dropped it, it would
 refuse everything after it. Only the action is refused. The gate reports it as a refusal
-and the simulated robot exits 2.
+and the simulated robot exits 2. Its receipt for that record says `refused`, reason `age`
+(section 4.5), so the refusal is in the journal beside the record it is about.
 
 Only command records have an age. A heartbeat or any other record is never stale.
 
@@ -259,6 +265,140 @@ want the command's time of origin from the controller itself.
 
 The planted bug for this is a gate with the age check removed: in scenario 11 the robot,
 stopped by the deadman, starts moving again on a command six seconds old.
+
+### 4.5 Receipts: what the gate did with each record
+
+Sections 4.2 to 4.4 give the gate several ways not to carry a command out. Until this
+section none of them reached the journal. A command the gate refused for its age was, in
+the journal, a command recorded and forwarded, and the verifier had no finding for it.
+The refusal was in the robot's own log and nowhere else.
+
+So the gate answers. When it is given a signing key of its own, it signs a receipt:
+
+- for every command record it takes into the chain: `applied` (the record's `applied`
+  went to the actuator), `blocked` (the record says blocked, and the safe-state action
+  went), or `refused` with the reason `age` (section 4.4);
+- for every message it refuses: `refused`, with the reason `signature` (not signed by the
+  recorder), `chain` (not the record after the gate's head, or a first record that is
+  not a genesis record) or `form` (not a well-formed record message: no record in it, a
+  hash that is not the record's, text that is not JSON, a command with no usable action);
+- for every deadman trip (section 4.3): `deadman`.
+
+Those four reasons are the four checks the gate makes. The gate checks no speed or range
+limit of its own: limits are rules in the ruleset, applied before the record is written
+and recomputed by the verifier (section 5).
+
+An accepted record that is not a command (a heartbeat, for example) gets no receipt. A
+`safe_state` message gets none either: it is not a record.
+
+```
+gate receipt:
+  "schema":    "sentinel-ledger/gate-receipt/0"
+  "seq":       the gate's own count of its receipts, from 0, with no gaps. Kept in the
+               gate's state file, so it carries on when the gate restarts
+  "decision":  "applied" | "blocked" | "refused" | "deadman"
+  "reason":    "age" | "signature" | "chain" | "form" for a refusal, otherwise null
+  "detail":    for a refusal, the gate's own sentence saying why, for example "the command
+               is 6003 ms old; the limit is 1000 ms". For a deadman trip, how long the
+               silence was. Otherwise null
+  "n", "hash": the number and leaf hash of the record the receipt is about. For applied,
+               blocked and refused for age: the command record. For a deadman trip: the
+               last record the gate had accepted. For the other refusals both are null:
+               those messages were never taken into the chain
+  "sent":      the action the gate sent to the actuator
+  "at_ms":     the gate's wall clock, whole milliseconds since 1970, or null where the
+               gate has no clock
+  "sig":       Ed25519 signature, with the gate's key, over the canonical form
+               (section 7.1) of every other field, as 128 hexadecimal characters
+```
+
+**The gate's key** is not the recorder's. It is a second Ed25519 key. The private half is
+a file on the gate's side that the recorder is never given. The public half is
+`gate_public_key` in the machine's configuration, 64 hexadecimal characters. It is copied
+into the first record's `settings`, and the configuration file is hashed into the state
+in force, so every record names it. A receipt signed with the recorder's key would be a
+statement the recorder could make without the gate. The gate still holds only the public
+half of the recorder's key and cannot make a record. A configuration with no
+`gate_public_key` means no receipts: the gate signs none, the recorder takes none, and the
+verifier expects none. Changing the key is not supported, as for the recorder's
+(section 7.6).
+
+**Order on the gate's side.** The gate acts first, then signs, then saves its state with
+the next receipt number in it, then sends the receipt. Signing delays no stop, and a
+number is not used twice.
+
+**The recorder** writes each receipt into the journal as a record of kind `gate_receipt`
+(section 7.2), holding the receipt whole, signature included. Before it writes, it checks
+two things: that the receipt is signed with the configured gate key, and that its `seq`
+is higher than that of the last receipt in the journal. A receipt that fails either is not
+written. So a receipt made by another node, or a genuine one sent twice, does not reach
+the journal. The recorder does not judge what a receipt says. Like every record, the
+`gate_receipt` record is numbered, chained, signed by the recorder and sent to the gate,
+which takes it into the chain and issues no receipt for it.
+
+One case needs a rule of its own. Once the gate's chain is broken it refuses every record,
+and each refusal makes a receipt, whose record the gate would refuse in turn. So a record
+of kind `gate_receipt` that is signed by the recorder and refused for its place in the
+chain gets no receipt. Another node cannot use that to hide anything of its own: it
+cannot sign a record.
+
+**Before a stop** the recorder waits for the receipts of commands it has already
+forwarded, for a bounded time (two seconds in the ROS node), because nothing is written
+after the stop record.
+
+**The verifier** (section 8) checks each receipt's signature against the gate key the
+first record names, and reports:
+
+- every refusal, with its reason, and every deadman trip. These are findings: something
+  was sent to the machine that the gate did not carry out, or the recorder was silent;
+- every command record that no receipt answers for, where the settings name a gate key;
+- every gap in the gate's numbering: a receipt the gate issued that the journal does not
+  hold;
+- every receipt that is not the gate's, or does not belong to the record it names.
+
+**What this adds.** A refusal is in the journal, signed by the component that made it,
+beside the record it is about. The command record itself is unchanged: it still says what
+was requested and what the safety layer applied. The receipt says what the gate then did.
+To remove a refusal from the journal, or to turn it into `applied`, takes the gate's key
+as well as the recorder's. With the recorder's key alone the rewritten receipt fails the
+gate's signature, and a deleted one leaves a command without a receipt and a gap in the
+numbering. Both are tests.
+
+**What it does not add.**
+
+- **It is the gate's statement.** It says what the gate sent. It does not show that the
+  actuator obeyed. Anyone who can read the gate's key file can make receipts.
+- **Two keys on one machine are still one custodian.** In the demo both key files belong
+  to the same user. The separation is between components. It becomes a separation of
+  custody only when the gate's key is somewhere the journal's keeper cannot read.
+- **A receipt is sent once.** If the recorder is stopped, in the safe state or gone when
+  a receipt arrives, the receipt is not written, and the gate does not send it again. The
+  verifier then reports the command as having no receipt, or the gap in the numbering.
+  That says the journal does not account for something. It does not say what the gate
+  decided.
+- **The numbering only shows a gap once something follows it.** A dropped receipt that
+  was about a command always shows, as a command with no receipt. A dropped receipt for
+  a refusal of something that was never a record shows only as a gap, and only when a
+  later receipt is in the journal. If it was the last receipt the gate ever issued,
+  nothing shows it.
+- **A journal read while it is still being written** can have a command whose receipt has
+  not arrived yet. The verifier reports it like any other.
+- **A `safe_state` message leaves no receipt.** Any party that can reach the gate can
+  send one and stop the machine without a trace in the journal.
+- **Nothing limits the rate.** Every message the gate refuses costs it a signature and
+  costs the recorder a record. A node that floods the gate's input fills the journal.
+- **Cost.** A command is now two records and two flushes to disk: the command, and the
+  receipt for it. The gate's signature is made in plain Python, takes a few milliseconds
+  and is not written to hide the key from someone who can time it.
+- **The file demo does not use it.** The gate program can sign receipts and append them
+  to a file (`--gate-key`, `--receipts`), and the command-line recorder takes one with the
+  operation `gate_receipt`. The five file scenarios do neither: their configuration names
+  no gate key, and nothing carries a receipt back while the recorder runs.
+
+The planted bugs for this are in the gate. One drops every receipt for a refusal before
+it is sent: the robot behaves exactly as it should, and the verifier reports the command
+with no receipt and the gap in the numbering. The other signs no receipts at all, which
+is the gate as it was: the verifier reports every command.
 
 ## 5. Core rule 2: requested and applied, and which rule acted
 
@@ -401,14 +541,16 @@ common to every record:
   "schema": "sentinel-ledger/record/0"
   "kind":   "genesis" | "recorder_start" | "recorder_stop" | "command"
             | "intervention_declared" | "intervention_detected" | "heartbeat"
-            | "recorder_fault" | "storage_stall" | "anchor_failed"
+            | "recorder_fault" | "storage_stall" | "anchor_failed" | "gate_receipt"
   "n":      position in the journal, from 0
   "prev":   hex leaf hash of record n-1, or "" for n = 0
   "at":     recorder clock, UTC, whole seconds, exactly YYYY-MM-DDTHH:MM:SSZ
   "sig":    Ed25519 signature over every other field, 128 hex characters (section 7.6)
 
 genesis:
-  "machine", "state" (section 6.1), "settings"
+  "machine", "state" (section 6.1), "settings": "heartbeat_seconds", "measure_every",
+  "recorder_public_key", "safe_state_action", and, when the configuration has them,
+  "gate_deadman_seconds", "gate_max_command_age_ms", "gate_public_key"
 
 command:
   "requested", "applied" (null when blocked), "outcome", "rules_acted",
@@ -448,6 +590,10 @@ storage_stall:
 anchor_failed:
   "entry_count" (the number of records the lost anchor statement covered), "detail".
   Written when an anchor statement could not be written (section 7.5).
+
+gate_receipt:
+  "receipt": one receipt from the gate, whole, with the gate's signature (section 4.5).
+  The record around it is signed by the recorder like any other.
 ```
 
 **Storage stalls.** A record's `at` is taken when the record is built, before it is
@@ -492,6 +638,9 @@ without detection. It is still only what the recorder's clock said. It is not a 
 timestamp.
 
 ### 7.3 Receipts
+
+This section is about receipts for a record's place in the journal. The gate's receipts,
+which say what the gate did with a record, are section 4.5 and are a different thing.
 
 A receipt for record `n` is a LogChain inclusion proof (FORMAT.md section 9) plus the
 record itself: `{"receipt_schema": "sentinel-ledger/receipt/0", "record": <the raw text>,
@@ -610,6 +759,11 @@ Every record is signed with Ed25519 (RFC 8032).
   configured public key.
 - **The gate** is given the public key when it is started, from its own copy of the
   configuration. It refuses any record whose signature does not verify.
+- **The gate's own key** is a second key of the same kind, used only to sign the gate's
+  receipts (section 4.5). Its private half is a file on the gate's side, held to the same
+  rule about who can read it. Its public half is `gate_public_key` in the configuration.
+  The recorder checks a receipt against it before writing the receipt down, and the
+  verifier checks every receipt in the journal against it.
 - **The verifier** checks every record's signature against the key the first record
   names. Given `--public-key`, it also requires that key to be the one supplied, which is
   how a journal re-signed throughout with someone else's key is caught.
@@ -626,16 +780,18 @@ What a signature does and does not add:
   A lost or exposed key means a new journal.
 - **The key is a file.** Keeping it in hardware (a TPM, a secure element, an HSM) so that
   it cannot be copied is out of scope.
-- The recorder signs with the `ed25519-dalek` library. The gate and the verifier each
-  carry their own verification code in plain Python, checked against the RFC's test
-  vectors. It takes about 4 ms a signature, so a long journal verifies slowly.
+- The recorder signs with the `ed25519-dalek` library, and checks the gate's receipts
+  with it. The gate and the verifier each carry their own verification code in plain
+  Python, checked against the RFC's test vectors. It takes about 4 ms a signature, so a
+  long journal verifies slowly. The gate's signing code is plain Python too, checked
+  against the same vectors.
 
 ## 8. The verifier
 
 ```
 python verifier/verify_journal.py JOURNAL --rulesets DIR [--root HEX]
                                   [--witness-store FILE] [--anchors DIR] [--gate-state FILE]
-                                  [--public-key HEX] [--decisions DIR]
+                                  [--public-key HEX] [--gate-public-key HEX] [--decisions DIR]
                                   [--profile FILE --as-of YYYY-MM-DD] [--json]
 python verifier/verify_journal.py --receipt FILE --root HEX
 ```
@@ -677,7 +833,13 @@ against the witness's anchors alone.
 | `ANCHOR_FAILED` | an `anchor_failed` record: the recorder states that an anchor statement could not be written. The records it would have covered have one piece of outside evidence fewer |
 | `SIGNATURE_MISSING` | a record has no `sig` |
 | `SIGNATURE_INVALID` | a record's `sig` is not a valid signature of its other fields under the key the first record names |
-| `KEY_MISMATCH` | `--public-key` was given and the first record names a different key |
+| `KEY_MISMATCH` | `--public-key` was given and the first record names a different key, or `--gate-public-key` was given and the first record names a different gate key or none |
+| `GATE_REFUSED` | a `gate_receipt` record whose receipt says `refused`: the gate did not carry something out. Reported with the reason (`age`, `signature`, `chain`, `form`), the gate's own sentence, and, for `age`, the number of the command record refused |
+| `GATE_DEADMAN` | a `gate_receipt` record whose receipt says `deadman`: the gate heard no valid record for its configured time and sent the safe state |
+| `COMMAND_WITHOUT_RECEIPT` | the settings name a gate key, and no receipt in the journal answers for this command record. Reported at the end, with the command's number |
+| `RECEIPT_MISSING` | the gate's receipt numbers skip: it issued receipts the journal does not hold. The first receipt in a journal must be number 0 |
+| `RECEIPT_INVALID` | a `gate_receipt` record that holds no well-formed receipt, or one not signed with the gate key the first record names, or one numbered at or below an earlier one, or the settings name no gate key |
+| `RECEIPT_MISMATCH` | a receipt signed by the gate that does not belong to the record it names: the record is not an earlier command, the hash is not that record's, the command already has a receipt, the receipt says `applied` and `sent` is not the record's `applied`, or it says `blocked` and the record was not |
 | `DECISION_MISMATCH` | a decision file is present and does not hash to `decision_sha256`, or is not `decision_bytes` long |
 
 `STORAGE_STALL` is a finding and the exit code is 2. The recorder could not record for
@@ -686,8 +848,16 @@ stall record; a stated stall too short to account for the silence leaves the
 `HEARTBEAT_GAP` in place beside it. A `storage_stall` record without usable numbers is
 `RECORD_MALFORMED` and explains nothing.
 
-A receipt is checked for `RECEIPT_LEAF_MISMATCH` (the record is not the leaf the proof is
-about) and `RECEIPT_ROOT_MISMATCH` (the proof does not lead to the supplied root).
+`GATE_REFUSED` and `GATE_DEADMAN` are findings and the exit code is 2, whether or not the
+refusal was the right thing for the gate to do. A journal with one of them is a journal
+in which the machine was sent something it did not carry out, or was left without a
+valid record for too long, and a reader should see that without having to look for it.
+A refusal for age marks its command as answered for, so that command is not also reported
+as `COMMAND_WITHOUT_RECEIPT`.
+
+A receipt of section 7.3 (`--receipt`) is checked for `RECEIPT_LEAF_MISMATCH` (the record
+is not the leaf the proof is about) and `RECEIPT_ROOT_MISMATCH` (the proof does not lead
+to the supplied root).
 
 Informational, never findings: commands under an opaque ruleset are counted as
 `not_recomputed`; decision files that are absent are counted as `decision_absent`; time
@@ -711,6 +881,9 @@ as asof-gate does, so the same inputs always give the same output.
   journal.
 - That every record was signed by a holder of the recorder's private key. With
   `--public-key`, that the key is the machine's.
+- Where the settings name a gate key: that for every command record a holder of the
+  gate's private key signed a statement of what the gate did with it, and which of
+  those statements were refusals. With `--gate-public-key`, that the key is the machine's.
 - Each command names the state the journal's own interventions put in force.
 - Under a declared ruleset, the recorded outcome is what that ruleset gives for the
   recorded request and the recorded safety inputs.
@@ -720,7 +893,9 @@ as asof-gate does, so the same inputs always give the same output.
 - That the safety inputs were true.
 - That the real safety layer ran the declared ruleset. `REPORTED_MISMATCH` catches a
   disagreement. Agreement does not prove the layer is correct.
-- That the command reached the actuator, or that the actuator obeyed.
+- That the actuator obeyed. A gate receipt says what the gate sent to it, in the gate's
+  own word. Where there are no receipts, not even that the command reached the gate.
+- What the gate decided about a command that has no receipt.
 - That nothing happened outside the recorder.
 
 ### 8.3 Showing the checks can fail
@@ -729,7 +904,9 @@ Before any result is trusted, the build plants bugs in the recorder (wrong clamp
 skipped rule, stale `in_force`, record written after forwarding, the same with failed
 writes ignored, heartbeats not written) and confirms a check exits non-zero for each. Each
 bug is a Cargo feature that is off by default. The table of planted bugs and which check
-caught each is in the README.
+caught each is in the README. The gate's planted bugs (no signature check, no deadman, no
+age check, receipts for refusals dropped, no receipts) are made by handing the robot a
+copy of the gate with one line changed.
 
 The recorder that forwards before it records is the instructive one. Its journal is a
 clean journal: the verifier given the journal alone finds nothing. It is caught by the
@@ -1034,6 +1211,9 @@ chained record was accepted:
   separate machines it needs synchronized clocks, which are not built (section 4.4).
 - **The deadman exists only where the gate has a clock.** The simulated robot has one.
   The file demo's gate does not.
+- **Gate receipts are the gate's own statement, sent once.** One that does not reach the
+  journal is reported as missing, not recovered. Both keys are files on one machine in
+  the demo. The file scenarios do not use receipts at all (section 4.5).
 - **Measurement is periodic.** A file changed and changed back between two measurements is
   not seen.
 - **The reference safety layer lives inside the recorder.** In the demo the recorder
@@ -1070,9 +1250,16 @@ sensor --JSON--> safety_inputs ----^
 | `cmd_vel_out` | `std_msgs/String` | recorder to robot | the message of section 4.2: the record's text, its number, its hash |
 | `recorder_status` | `std_msgs/String` | out of the recorder | one JSON reply for each input handled |
 | `gate_events` | `std_msgs/String` | out of the robot | one JSON line for each message the gate judged |
+| `gate_receipts` | `std_msgs/String` | robot to recorder | the gate's signed receipts (section 4.5), one message each |
 
 `cmd_vel_out` is reliable and transient local with a history of 1000, so a robot that
 starts after the recorder still receives the chain from its first record.
+`gate_receipts` has the same settings. A recorder that starts after the robot is sent
+the robot's earlier receipts again and writes none of them twice: it takes only a receipt
+numbered above the last one in the journal.
+
+The launch file gives the robot the gate's key file, `robot_private/gate.key`, when the
+configuration names a `gate_public_key`. The recorder node is never given that file.
 
 The recorder node creates no publisher of `Twist`. The robot subscribes to no `Twist`. The
 only thing that sets the robot's velocity is an action the gate hands it.
@@ -1168,8 +1355,12 @@ The scenarios play a second node publishing straight onto the robot's input:
 | the same, properly signed with a key of the forger's own | refused | not signed by the recorder | scenario 8 |
 | the same, with no signature | refused | not signed by the recorder | scenario 9 |
 
-In scenarios 7 to 9 the robot never moves at the forger's speed, the recorder's own next
-command is accepted, and the journal verifies.
+In scenarios 7 to 9 the robot never moves at the forger's speed and the recorder's own
+next command is accepted. In all of scenarios 6 to 9 the journal's chain, signatures and
+rules check out, and the verifier exits 2 with `GATE_REFUSED`: the journal holds the
+gate's receipt for each refusal, with the reason in the third column as `form` (no
+record, the hash), `chain` or `signature`. Before receipts the verifier exited 0 on these
+journals and nothing in them said another node had tried.
 
 Before records were signed, the forged record of scenario 7 was accepted and moved the
 robot at 1500 mm/s. A test keeps that visible: it hands the robot a copy of the gate with
@@ -1177,7 +1368,8 @@ the signature check removed, and scenario 7 turns red in exactly that way.
 
 What is left: a node that can read the recorder's private key file can still forge
 (section 7.6). And every refusal sends the safe state, so a node that publishes junk on
-`cmd_vel_out` cannot move the robot, but it can stop it, as often as it likes.
+`cmd_vel_out` cannot move the robot, but it can stop it, as often as it likes. Each time
+costs the gate a signature and the journal a record, and nothing limits the rate.
 
 ### 15.6 Gaps, and the bound
 
@@ -1185,7 +1377,7 @@ A gap is a record number the gate did not see. What can pass in each case:
 
 | how the gap arises | unrecorded commands that reach the robot | then |
 |---|---|---|
-| the node records a command and never publishes it (planted bug) | none | the gate refuses every later record; the robot gets only the safe state; the journal is whole |
+| the node records a command and never publishes it (planted bug) | none | the gate refuses every later record; the robot gets only the safe state; the journal is whole and says so: `GATE_REFUSED` for each refusal, `COMMAND_WITHOUT_RECEIPT` for each command not carried out, and `GATE_DEADMAN`, because with every record refused the gate hears no valid one |
 | a message is lost in transit | none | the same |
 | the node publishes before it writes, and the write fails (planted bug) | one, with this recorder | `GATE_HEAD_NOT_IN_JOURNAL`; on restart the gate refuses the recorder |
 | a recorder that ignores failed writes (section 4.2) | any number, until the gate's head is compared with the journal | the same finding |
@@ -1198,7 +1390,9 @@ reached the disk.
 A recorder that says nothing at all is a different case from a gap in the numbers. The
 gate sees no record to refuse. That is the deadman's case (section 4.3): scenario 10
 freezes the recorder's process for ten seconds with the robot at 0.5 m/s, and the robot
-is stopped after four.
+is stopped after four. The gate's receipt for the trip waits on the topic until the
+recorder is running again and is then written down, so the journal shows the gap
+(`HEARTBEAT_GAP`) and what the robot did about it (`GATE_DEADMAN`).
 
 ### 15.7 What the ROS version does not cover
 
@@ -1231,6 +1425,13 @@ is stopped after four.
   node and the robot run on the same computer in every test (section 4.4).
 - **The age starts at the node's callback.** A Twist has no time stamp of its own. Time a
   message spent queued before the node's code ran is not counted.
+- **Who publishes `gate_receipts`.** Any node can. One that cannot sign with the gate's
+  key gets nothing written. One that replays the gate's own receipts gets nothing
+  written twice.
+- **A receipt that arrives when the recorder cannot write** (stopped, in the safe state,
+  not running) is lost. The gate sends each once. After scenario 5's fault, a deadman
+  trip on a slow machine would leave a gap in the gate's numbering for that reason.
+- **Both key files are on one machine and belong to one user** in every test.
 
 ### 15.8 When the disk is slow
 
@@ -1271,11 +1472,14 @@ speed for the whole of the silence.
 2. The command that was held up is not carried out when it finally arrives. The gate
    refuses a command older than `gate_max_command_age_ms` (section 4.4), 1000 in the
    demo, and the robot stays in the safe state. Scenario 11.
-3. When the slow write completes, the recorder writes a `storage_stall` record with the
+3. The gate signs a receipt for the deadman trip and one for the refusal, and the
+   recorder writes both into the journal (section 4.5). The verifier reports
+   `GATE_DEADMAN` and `GATE_REFUSED` with the reason `age`. Scenario 11.
+4. When the slow write completes, the recorder writes a `storage_stall` record with the
    measured duration (section 7.2), and the verifier reports `STORAGE_STALL` in place of
    an unexplained gap (section 8). It is still a finding. Scenario 11, on a test build
    whose flush can be made slow on demand, since a real disk cannot be told to stall.
-4. Anchor statements are flushed off the lock (sections 7.5 and 15.4), which removes the
+5. Anchor statements are flushed off the lock (sections 7.5 and 15.4), which removes the
    longest wait measured. One that cannot be written is stated in the journal. Scenario 12.
 
 None of this makes the recorder faster. On a disk that takes eight seconds, a command
@@ -1290,6 +1494,34 @@ fresh command after that moves the robot as usual. Before the age check existed 
 robot started moving again at six seconds on the old command; the planted bug keeps that
 visible.
 
+The journal of one such run, record by record:
+
+```
+ 2  command        applied 500 mm/s
+ 3  gate_receipt   receipt 0: applied, record 2
+ 4  command        applied 200 mm/s           (this record took six seconds to write)
+ 5  storage_stall  record 4, 6000 ms
+ 6  gate_receipt   receipt 1: deadman, "no valid record for 4.041 s; the limit is 4 s"
+ 7  gate_receipt   receipt 2: refused, age, record 4, "the command is 6003 ms old; the limit is 1000 ms"
+ 8  command        applied 300 mm/s
+ 9  gate_receipt   receipt 3: applied, record 8
+```
+
+and what the verifier prints for it:
+
+```
+gate receipts:    4 in the journal: 1 refusal(s), 1 deadman trip(s); 0 command(s) with no receipt
+storage stalls:   1 stated by the recorder (each is a finding below)
+  STORAGE_STALL n=5 step="journal_write" of_record=4 stalled_ms=6000 previous="2026-10-10T14:27:45Z" at="2026-10-10T14:27:51Z"
+  GATE_DEADMAN n=6 gate_seq=1 last_record_accepted=3 detail="no valid record for 4.041 s; the limit is 4 s"
+  GATE_REFUSED n=7 gate_seq=2 reason="age" of_record=4 detail="the command is 6003 ms old; the limit is 1000 ms"
+3 FINDING(S)
+```
+
+Record 4 still reads as it did before receipts: requested 200, applied 200. Record 7 is
+what says the robot never did it. The two receipts written at records 6 and 7 were
+issued four and six seconds into the stall and waited until the recorder could write.
+
 **Tests, and where the journal is kept for them.** The scenarios are judged pass or fail
 and several depend on timing. On the disk above a round of them often has a run that
 ends differently (6 rounds of 10 in the soak below), for a reason that is true and is not
@@ -1301,24 +1533,30 @@ journal in RAM does not survive power-off, and a flush there proves nothing abou
 a number of rounds and reports flush times, stall records, deadman trips and verifier
 findings as measurements. It has no pass or fail and exits 0 whenever it could run.
 
-One soak, on the disk above, on the code as it is now: ten rounds of scenarios 1 to 10
-and 12, 110 scenario runs in 719 seconds. `gate_max_command_age_ms` was 1,000.
+One soak, on the disk above, on the code as it is now, receipts included: ten rounds of
+scenarios 1 to 10 and 12, 110 scenario runs in 782 seconds, 10 October 2026.
+`gate_max_command_age_ms` was 1,000.
 
 | | measured |
 |---|---|
-| journal flushes | 545: median 6.0 ms, longest 3.30 s, 32 over 0.5 s, 23 over 1 s, 0 over 4 s |
-| anchor flushes, off the lock | 257: median 3.4 ms, longest 2.53 s, 15 over 0.5 s |
+| journal flushes | 993: median 4.6 ms, longest 3.33 s, 37 over 0.5 s, 24 over 1 s, 0 over 4 s |
+| anchor flushes, off the lock | 392: median 3.3 ms, longest 3.75 s, 12 over 0.5 s |
+| records in the 110 journals | 1,243, of which 350 command records and 441 gate receipts |
 | `storage_stall` records written | 0: no flush left a gap past the threshold |
-| commands the gate refused for their age | 8, out of 330 it would otherwise have carried out |
-| deadman trips | 11: one in each round from scenario 10, and one more in a run where commands were also refused for their age |
-| verifier findings beyond those the scenarios cause on purpose | none |
+| what the gate did with the 350 command records | applied 325, 19 were blocked commands, refused 6 for their age |
+| deadman trips | 11: one in each round from scenario 10, and one in a run of scenario 1, where the next command was then refused for its age |
+| receipts in the journals for those | all 6 refusals for age, all 11 deadman trips |
+| what the verifier reported, run over the 110 journals | `GATE_REFUSED` with reason `age` 6 times, `GATE_DEADMAN` 11 times; no `COMMAND_WITHOUT_RECEIPT`, no `RECEIPT_MISSING`, no `RECEIPT_INVALID`, no `RECEIPT_MISMATCH` |
+| other verifier findings | only those the scenarios cause on purpose: `HEARTBEAT_GAP` in 5 and 10, `GATE_REFUSED` for the 80 messages another node sent in 6 to 9, `ANCHOR_FAILED` in 12 |
 | scenario runs not as the pass/fail run expects | 6 of 110, each because a command was refused for its age |
-| the clock log | 7,193 lines, largest step 0.121 s |
+| the clock log | 7,820 lines, largest step 0.115 s |
 
 Ten rounds on one disk on one day. No flush went past the heartbeat threshold in this run,
 so it did not put the stall record to work on a real disk; scenario 11 does that with the
-test build. What it shows is the limit on a command's age at work: a flush of one to three
-seconds is too short to be a stall and long enough to make a command late, and the gate
-refused those commands and kept the safe state. A refusal for age is in the robot's own
-log and exit code. The journal shows the command recorded and forwarded, and the verifier
-has no finding for it. This is not a measure of how often that disk stalls.
+test build. What it shows is the limit on a command's age at work, and the receipts: a
+flush of one to three seconds is too short to be a stall and long enough to make a
+command late, the gate refused those commands and kept the safe state, and each refusal
+is in the journal and in the verifier's report. The soak before receipts (545 journal
+flushes, 8 refusals for age, one deadman trip nobody planned) left none of those nine
+events in any journal. The number of journal flushes nearly doubled, because each
+command is now two records. This is not a measure of how often that disk stalls.

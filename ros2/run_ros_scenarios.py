@@ -18,6 +18,10 @@ launch`, as two processes, and then acts as the other nodes on the graph: a cont
 publishing Twist on cmd_vel_in, a safety sensor publishing on safety_inputs, and, where
 the scenario calls for it, a rogue node publishing on cmd_vel_out.
 
+The robot's gate signs a receipt for every command record it takes in, every message it
+refuses and every deadman trip, and the recorder writes each receipt into the journal.
+Every scenario checks the receipts the journal ends up holding.
+
 Exit 0 only if every observation of every scenario is the expected one.
 
   1  clean run: commands inside the limits, all six Twist fields, a quiet period with heartbeats
@@ -25,7 +29,8 @@ Exit 0 only if every observation of every scenario is the expected one.
   3  no safety signal, then a broken light curtain: blocked, the robot gets the safe state
   4  a declared ruleset upload; firmware changed behind the recorder's back, found at the next start
   5  the journal becomes unwritable: the command is not forwarded; then a restart
-  6  another node publishes to cmd_vel_out: no record, junk, a replay, a tampered record, a gap. All refused
+  6  another node publishes to cmd_vel_out: no record, junk, a replay, a tampered record, a gap. All
+     refused, and each refusal is in the journal with its reason
   7  another node forges a correctly chained record, with a signature lifted from a real one: refused
   8  the same, signed with a key of the forger's own: refused
   9  the same, with no signature at all: refused
@@ -34,7 +39,9 @@ Exit 0 only if every observation of every scenario is the expected one.
  11  one flush to disk takes six seconds (needs --slow-flush-node, a test build): the
      deadman stops the robot; the command, six seconds old when its record lands, is
      refused for its age and the robot stays stopped; the recorder states the stall in a
-     record, and the verifier reports a storage stall and not an unexplained gap
+     record, and the verifier reports a storage stall and not an unexplained gap; the
+     refusal for age and the deadman trip are in the journal as receipts, and the
+     verifier reports both
  12  the folder for anchor statements becomes unwritable: commands still go through, and
      the recorder states the lost anchor in a signed record, which the verifier reports
 """
@@ -97,9 +104,18 @@ class Session:
         with os.fdopen(os.open(self.key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
             fh.write(seed.hex() + "\n")
         self.public_key = ed.public_key(seed).hex()
+        # The gate's own key, for its receipts: a different key, in a folder on the
+        # robot's side. The recorder is never given this file.
+        self.gate_key_file = os.path.join(self.dir, "robot_private", "gate.key")
+        os.makedirs(os.path.dirname(self.gate_key_file))
+        gate_seed = os.urandom(32)
+        with os.fdopen(os.open(self.gate_key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+            fh.write(gate_seed.hex() + "\n")
+        self.gate_public_key = ed.public_key(gate_seed).hex()
         config_path = os.path.join(self.installed, "config.json")
         with open(config_path, encoding="utf-8") as fh:
             config = fh.read().replace('"recorder_public_key": ""', '"recorder_public_key": "%s"' % self.public_key)
+            config = config.replace('"gate_public_key": ""', '"gate_public_key": "%s"' % self.gate_public_key)
         with open(config_path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(config)
         self.data = os.path.join(self.dir, "data")
@@ -207,17 +223,40 @@ class Session:
                                       for e in self.gate_events[judged:]), 5, "the gate")
             except TimedOut:
                 pass
+            self.receipt_settled(seen, judged, lambda e: e.get("of") == reply["n"])
         self.quiet(0.2)
         return reply
+
+    def receipt_settled(self, seen, judged, mine):
+        """Wait until the gate's receipt picked out by `mine` has been written into the
+        journal and its record has in turn reached the gate. If it never comes, carry on:
+        what the journal then lacks is for the verifier to say."""
+        found = lambda: [e for e in self.statuses[seen:] if e.get("kind") == "gate_receipt" and mine(e)]
+        try:
+            self.wait(lambda: bool(found()), 3, "the gate's receipt")
+            if found()[0].get("ok"):
+                self.wait(lambda: any(e.get("head", -1) >= found()[0]["n"] for e in self.gate_events[judged:]),
+                          3, "the receipt's record to reach the gate")
+        except TimedOut:
+            pass
+
+    def gate_head(self):
+        """The number and hash of the last record the gate accepted, from its state file."""
+        with open(self.gate_state, encoding="utf-8") as fh:
+            state = json.load(fh)
+        return state["n"], state["hash"]
 
     def rogue(self, text):
         """Publish straight onto the robot's input. Returns what the gate said."""
         # Heartbeat records reach the gate at any moment, so the event is matched to this
         # exact message and not taken as "the next one".
         judged, mark = len(self.gate_events), hashlib.sha256(text.encode("utf-8")).hexdigest()
+        seen = len(self.statuses)
         self.rogue_pub.publish(String(data=text))
         mine = lambda: [e for e in self.gate_events[judged:] if e.get("message_sha256") == mark]
         self.wait(lambda: bool(mine()), 10, "the gate to judge a rogue message")
+        # The refusal's receipt goes to the recorder, which writes a record of it.
+        self.receipt_settled(seen, judged, lambda e: True)
         return mine()[0]
 
     def last_command_message(self):
@@ -238,12 +277,45 @@ class Session:
         done = subprocess.run(
             [sys.executable, VERIFIER, self.journal, "--root", str(root or self.state_root()),
              "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state,
-             "--public-key", self.public_key, "--json"],
+             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key, "--json"],
             capture_output=True, text=True)
         try:
             return done.returncode, json.loads(done.stdout)
         except ValueError:
             return done.returncode, {}
+
+    def verify_text(self, root=None):
+        """The verifier's report as a person reads it. Also kept in the scenario's folder."""
+        done = subprocess.run(
+            [sys.executable, VERIFIER, self.journal, "--root", str(root or self.state_root()),
+             "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state,
+             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key],
+            capture_output=True, text=True)
+        with open(os.path.join(self.dir, "verifier_output.txt"), "w", encoding="utf-8") as fh:
+            fh.write(done.stdout)
+        return done.stdout
+
+    def records(self):
+        with open(self.journal, encoding="utf-8") as fh:
+            return [json.loads(json.loads(line)["raw"]) for line in fh]
+
+    def receipts(self):
+        """What the gate's receipts in the journal say, in order: "applied", "blocked",
+        "deadman", or "refused:" and the reason. Only receipts the gate really signed."""
+        said = []
+        for record in self.records():
+            if record["kind"] != "gate_receipt":
+                continue
+            receipt = record["receipt"]
+            body = {k: v for k, v in receipt.items() if k != "sig"}
+            text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            if not ed.verify(bytes.fromhex(self.gate_public_key), text.encode("utf-8"), bytes.fromhex(receipt["sig"])):
+                said.append("not signed by the gate")
+            elif receipt["decision"] == "refused":
+                said.append("refused:" + receipt["reason"])
+            else:
+                said.append(receipt["decision"])
+        return said
 
     def recorder_pid(self):
         """The process id of this scenario's recorder node, found by what it is running
@@ -283,7 +355,7 @@ def kinds(report):
 def summary(s, stopped, report_pair):
     code, report = report_pair
     return {"recorder_exit": s.exits[-1][0], "robot_exit": s.exits[-1][1], "verifier_exit": code,
-            "findings": kinds(report), "stopped_cleanly": bool(stopped.get("ok"))}
+            "findings": kinds(report), "stopped_cleanly": bool(stopped.get("ok")), "receipts": s.receipts()}
 
 
 def scenario_1(s):
@@ -395,6 +467,7 @@ def scenario_5(s):
     stopped = s.end()
     code, report = s.verify(stopped.get("root"))
     obs.update(restart_reply_ok=again.get("ok"), exits_after_restart=s.exits[-1],
+               receipts_after_restart=s.receipts(),
                verifier_exit_after_restart=code, findings_after_restart=kinds(report),
                applied_after_restart=[v for why, v in s.sent() if why == "applied"][len(obs["applied"]):])
     return obs
@@ -405,7 +478,6 @@ def scenario_6(s):
     s.inputs(CLEAR)
     s.command(0.5)
     real = s.last_command_message()
-    head = json.loads(real["record"])["n"]
     fast = {f: 0 for f in ("linear_x_mm_s", "linear_y_mm_s", "linear_z_mm_s", "angular_x_mrad_s",
                            "angular_y_mrad_s", "angular_z_mrad_s")}
     fast["linear_x_mm_s"] = 1500
@@ -415,7 +487,7 @@ def scenario_6(s):
 
     obs = {}
     # A command with no record at all, the way a node that only knows "publish to the robot" would send it.
-    obs["no_record"] = refused(s.rogue(json.dumps({"type": "record", "n": head + 1, "action": fast})))
+    obs["no_record"] = refused(s.rogue(json.dumps({"type": "record", "n": s.gate_head()[0] + 1, "action": fast})))
     obs["not_json"] = refused(s.rogue("linear: {x: 1.5}"))
     # A real record the recorder sent earlier, sent again.
     replay = s.rogue(json.dumps(real))
@@ -429,7 +501,9 @@ def scenario_6(s):
     # A well-formed record with a correct hash, but two ahead of the gate's head: a gap.
     # The rogue cannot sign it, so it is refused before its position is even considered.
     # A gap made of genuinely signed records is the planted bug in tests/test_ros2.py.
-    ahead = json.dumps({"kind": "command", "n": head + 2, "prev": real["hash"], "applied": fast,
+    # (Each refusal above put a receipt record in the journal, so the head has moved on.)
+    head, head_hash = s.gate_head()
+    ahead = json.dumps({"kind": "command", "n": head + 2, "prev": head_hash, "applied": fast,
                         "outcome": "unchanged"}, sort_keys=True, separators=(",", ":"))
     gap = s.rogue(json.dumps({"type": "record", "n": head + 2, "hash": leaf_hash(ahead), "record": ahead}))
     obs["gap"] = refused(gap)
@@ -450,7 +524,9 @@ def forged_next_record(s, sign):
     s.command(0.5)
     real = s.last_command_message()
     record = json.loads(real["record"])
-    record.update(n=record["n"] + 1, prev=real["hash"])
+    # The gate's head is no longer that command: the receipt for it is a record too.
+    head, head_hash = s.gate_head()
+    record.update(n=head + 1, prev=head_hash)
     for where in (record, record["reported"]):
         where["applied"] = dict(record["requested"], linear_x_mm_s=1500)
     forged = json.dumps(sign(record), sort_keys=True, separators=(",", ":"))
@@ -528,6 +604,14 @@ def scenario_11(s):
     code, report = s.verify(stopped.get("root"))
     obs = summary(s, stopped, (code, report))
     stalls = [f for f in report.get("findings", []) if f["finding"] == "STORAGE_STALL"]
+    # The refusal for age, as the journal holds it and as the verifier reports it.
+    records = s.records()
+    slow_n = slow.get("n")
+    slow_hash = leaf_hash(json.dumps(records[slow_n], sort_keys=True, separators=(",", ":"))) if slow_n else None
+    in_journal = [r["receipt"] for r in records if r["kind"] == "gate_receipt" and r["receipt"]["reason"] == "age"]
+    reported = [f for f in report.get("findings", []) if f["finding"] == "GATE_REFUSED"]
+    text = s.verify_text(stopped.get("root"))
+    line = [l for l in text.splitlines() if l.strip().startswith("GATE_REFUSED")]
     obs.update(sent=s.sent(), deadman_trips=len(s.deadman_events()), slow_command_ok=slow.get("ok"),
                # The slow command was recorded, and was not carried out: six seconds old
                # against a limit of one.
@@ -538,7 +622,18 @@ def scenario_11(s):
                stalls_stated=report.get("counts", {}).get("storage_stalls"),
                stall_is_of_the_slow_record=bool(stalls) and stalls[0]["of_record"] == slow.get("n")
                and stalls[0]["n"] == slow.get("n") + 1,
-               stated_duration_fits=bool(stalls) and 6000 <= stalls[0]["stalled_ms"] < 9000)
+               stated_duration_fits=bool(stalls) and 6000 <= stalls[0]["stalled_ms"] < 9000,
+               # The journal holds a receipt, signed by the gate, that names the slow
+               # record by number and hash and says it was refused for its age.
+               age_refusal_in_journal=len(in_journal) == 1 and in_journal[0]["decision"] == "refused"
+               and in_journal[0]["n"] == slow_n and in_journal[0]["hash"] == slow_hash
+               and "ms old" in (in_journal[0]["detail"] or ""),
+               verifier_reports_the_age_refusal=len(reported) == 1 and reported[0]["reason"] == "age"
+               and reported[0]["of_record"] == slow_n,
+               verifier_output_shows_it=len(line) == 1 and 'reason="age"' in line[0]
+               and "of_record=%s" % slow_n in line[0] and "ms old" in line[0],
+               the_record_itself_is_unchanged=slow_n is not None and records[slow_n]["kind"] == "command"
+               and records[slow_n]["outcome"] == "unchanged")
     return obs
 
 
@@ -574,49 +669,67 @@ SCENARIOS = {1: scenario_1, 2: scenario_2, 3: scenario_3, 4: scenario_4, 5: scen
 NEEDS_SLOW_FLUSH_NODE = (11,)
 CLEAN = {"recorder_exit": 0, "robot_exit": 0, "verifier_exit": 0, "findings": [], "stopped_cleanly": True}
 REFUSED = (False, "gate_refused")
+# Every scenario also says which receipts the journal must hold, in order.
 EXPECTED = {
-    1: dict(CLEAN, commands=5, unchanged=5, at_least_two_heartbeats=True,
+    1: dict(CLEAN, receipts=["applied"] * 5, commands=5, unchanged=5, at_least_two_heartbeats=True,
             sent=[("applied", 200), ("applied", 400), ("applied", 100), ("applied", 900), ("applied", 300)],
             all_six_fields={"linear_x_mm_s": 100, "linear_y_mm_s": 20, "linear_z_mm_s": 3,
                             "angular_x_mrad_s": 400, "angular_y_mrad_s": 50, "angular_z_mrad_s": 6}),
-    2: dict(CLEAN, replies_ok=[True, True, True, False, False, False, True], commands=4, changed=2, unchanged=2,
+    2: dict(CLEAN, receipts=["applied"] * 4,
+            replies_ok=[True, True, True, False, False, False, True], commands=4, changed=2, unchanged=2,
             sent=[("applied", 800), ("applied", 1500), ("applied", -1500), ("applied", 1500)],
             clamped_record_requested=1800, clamped_record_applied=1500, clamped_record_rules=["R2-forward-speed"]),
-    3: dict(CLEAN, first_outcome="blocked", blocked=2,
+    3: dict(CLEAN, receipts=["blocked", "applied", "blocked", "applied"], first_outcome="blocked", blocked=2,
             sent=[("blocked", 0), ("applied", 500), ("blocked", 0), ("applied", 500)]),
-    4: dict(CLEAN, declare_ok=True, declared=1, detected=1, changed=1, exits_first_launch=(0, 0),
+    4: dict(CLEAN, receipts=["applied"] * 3,
+            declare_ok=True, declared=1, detected=1, changed=1, exits_first_launch=(0, 0),
             sent=[("applied", 400), ("applied", 1000), ("applied", 900)]),
-    5: dict(CLEAN, recorder_exit=3, stopped_cleanly=False, replies_ok=[True, True, False, False],
+    5: dict(CLEAN, receipts=["applied"] * 2, receipts_after_restart=["applied"] * 3,
+            recorder_exit=3, stopped_cleanly=False, replies_ok=[True, True, False, False],
             commands_recorded=2, applied=[500, 700], only_safe_state_after_the_fault=True,
             restart_reply_ok=True, exits_after_restart=(0, 0), verifier_exit_after_restart=2,
             findings_after_restart=["HEARTBEAT_GAP"], applied_after_restart=[400]),
-    6: dict(CLEAN, robot_exit=2, no_record=REFUSED, not_json=REFUSED, replay=REFUSED, tampered=REFUSED,
+    # Five refusals: the verifier now reports each one, with the reason the gate gave.
+    6: dict(CLEAN, robot_exit=2, verifier_exit=2, findings=["GATE_REFUSED"],
+            receipts=["applied", "refused:form", "refused:form", "refused:chain", "refused:form",
+                      "refused:signature", "applied"],
+            no_record=REFUSED, not_json=REFUSED, replay=REFUSED, tampered=REFUSED,
             gap=REFUSED, replay_refused_for_its_position=True, command_after_ok=True,
             sent=[("applied", 500)] + [("gate_refused", 0)] * 5 + [("applied", 600)]),
 }
 # A forged next record, three ways. In each: refused for its signature, the robot never
 # moves at the forger's 1500, the recorder's own next command still goes through, and the
-# journal is whole.
-FORGERY_REFUSED = dict(CLEAN, robot_exit=2, forged=REFUSED, refused_for_its_signature=True, command_after_ok=True,
+# journal is whole. The journal also says the gate refused something, and why.
+FORGERY_REFUSED = dict(CLEAN, robot_exit=2, verifier_exit=2, findings=["GATE_REFUSED"],
+                       receipts=["applied", "refused:signature", "applied"],
+                       forged=REFUSED, refused_for_its_signature=True, command_after_ok=True,
                        sent=[("applied", 500), ("gate_refused", 0), ("applied", 600)])
 EXPECTED.update({7: FORGERY_REFUSED, 8: FORGERY_REFUSED, 9: FORGERY_REFUSED})
 # The recorder silent for ten seconds: the robot is stopped by the deadman, and the gap is
-# in the journal as a gap, because nothing the recorder wrote explains it.
-EXPECTED[10] = dict(CLEAN, verifier_exit=2, findings=["HEARTBEAT_GAP"], deadman_trips=1, tripped_in_time=True,
+# in the journal as a gap, because nothing the recorder wrote explains it. The deadman
+# trip is in the journal too, as the gate's receipt, written once the recorder is back.
+EXPECTED[10] = dict(CLEAN, verifier_exit=2, findings=["GATE_DEADMAN", "HEARTBEAT_GAP"],
+                    receipts=["applied", "deadman", "applied"], deadman_trips=1, tripped_in_time=True,
                     robot_stopped_short=True, command_after_ok=True,
                     sent=[("applied", 500), ("deadman", 0), ("applied", 300)])
 # A six-second flush: the robot is stopped by the deadman at four seconds and stays
 # stopped, because the command whose record then lands is six seconds old and the gate
 # refuses to carry it out. The journal says what happened. Still a finding, still exit 2.
 # The robot exits 2 because its gate refused something, which is the expected result here.
-EXPECTED[11] = dict(CLEAN, robot_exit=2, verifier_exit=2, findings=["STORAGE_STALL"], deadman_trips=1,
+# The journal also holds the gate's receipts for the deadman trip and for the refusal.
+EXPECTED[11] = dict(CLEAN, robot_exit=2, verifier_exit=2,
+                    findings=["GATE_DEADMAN", "GATE_REFUSED", "STORAGE_STALL"],
+                    receipts=["applied", "deadman", "refused:age", "applied"],
+                    age_refusal_in_journal=True, verifier_reports_the_age_refusal=True,
+                    verifier_output_shows_it=True, the_record_itself_is_unchanged=True, deadman_trips=1,
                     slow_command_ok=True, stale_refusals=1, stale_command_was_the_slow_one=True,
                     command_after_ok=True, stalls_stated=1, stall_is_of_the_slow_record=True,
                     stated_duration_fits=True,
                     sent=[("applied", 500), ("deadman", 0), ("stale_command", 0), ("applied", 300)])
 # Anchor statements cannot be written: not a fault, every command goes out, and the
 # journal carries a signed record of each statement lost. The verifier reports them.
-EXPECTED[12] = dict(CLEAN, verifier_exit=2, findings=["ANCHOR_FAILED"], replies_ok=[True] * 5,
+EXPECTED[12] = dict(CLEAN, verifier_exit=2, findings=["ANCHOR_FAILED"], receipts=["applied"] * 6,
+                    replies_ok=[True] * 5,
                     anchor_failures_stated=True, each_names_a_statement_that_is_missing=True, each_is_signed=True,
                     status_also_said_so=True,
                     sent=[("applied", 500), ("applied", 200), ("applied", 300), ("applied", 400), ("applied", 500),

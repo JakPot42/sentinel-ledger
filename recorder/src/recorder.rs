@@ -9,6 +9,7 @@
 //! network: anchoring means writing a small statement file that another program sends on.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -28,6 +29,7 @@ use crate::state::{Component, Config, State, sha256_hex};
 
 pub const SCHEMA: &str = "sentinel-ledger/record/0";
 pub const ANCHOR_SCHEMA: &str = "sentinel-ledger/anchor/0";
+pub const GATE_RECEIPT_SCHEMA: &str = "sentinel-ledger/gate-receipt/0";
 const AT_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
 /// Why an operation did not complete.
@@ -112,6 +114,12 @@ pub struct Recorder {
     /// kind counting from 1, how long). Cannot be set in a normal build.
     slow_flush: Option<(String, usize, std::time::Duration)>,
     writes_of_kind: BTreeMap<String, usize>,
+    /// The number of the last gate receipt written to the journal. A receipt with that
+    /// number or a lower one is not written again.
+    last_receipt_seq: Option<u64>,
+    /// Command records forwarded by this process for which no receipt has come back yet.
+    /// Only kept when the configuration names a gate key.
+    awaiting_receipt: BTreeSet<usize>,
 }
 
 /// Time spent in storage steps over one interval between records, on the monotonic clock.
@@ -188,6 +196,8 @@ impl Recorder {
             anchor_failures: VecDeque::new(),
             slow_flush: None,
             writes_of_kind: BTreeMap::new(),
+            last_receipt_seq: None,
+            awaiting_receipt: BTreeSet::new(),
         };
         // A test build can be told to make one flush slow: SL_TEST_SLOW_FLUSH=kind:which:ms.
         #[cfg(feature = "test-slow-flush")]
@@ -231,6 +241,7 @@ impl Recorder {
                             rec.state.set(change["target"].as_str().unwrap_or(""), &change["measured"])?;
                         }
                     }
+                    Some("gate_receipt") => rec.last_receipt_seq = r["receipt"]["seq"].as_u64(),
                     _ => {}
                 }
                 rec.last_at = Some(parse_at(r["at"].as_str().unwrap_or(""))?);
@@ -437,8 +448,8 @@ impl Recorder {
         self.to_gate(json!({"type": "record", "n": n, "hash": hash, "record": raw}))
     }
 
-    /// Build, write, then forward a record that is not a command.
-    fn append(&mut self, kind: &str, fields: Map<String, Value>) -> Result<(), String> {
+    /// Build, write, then forward a record that is not a command. Returns its number.
+    fn append(&mut self, kind: &str, fields: Map<String, Value>) -> Result<usize, String> {
         self.begin_record()?;
         let n = self.n;
         let (raw, hash, at) = self.build(kind, fields)?;
@@ -447,7 +458,10 @@ impl Recorder {
         self.anchor(false)?;
         // Nothing is written after the stop record, so a stall in writing the stop
         // record itself, or a failure to write the last anchor, is never stated.
-        if kind == "recorder_stop" { Ok(()) } else { self.report_stalls() }
+        if kind != "recorder_stop" {
+            self.report_stalls()?;
+        }
+        Ok(n)
     }
 
     /// Section 7.5: every `anchor_every` records, and at an orderly stop, write a
@@ -589,6 +603,9 @@ impl Recorder {
         if let Err(e) = self.forward(n, &hash, &raw) {
             return Err(self.enter_fault("forward", e));
         }
+        if self.config.gate_public_key.is_some() {
+            self.awaiting_receipt.insert(n);
+        }
         self.anchor(false).map_err(|e| self.enter_fault("anchor", e))?;
         // The command has gone to the gate. If writing it stalled, say so now.
         self.report_stalls().map_err(|e| self.enter_fault("append", e))?;
@@ -618,6 +635,9 @@ impl Recorder {
             let parsed = Config::parse(&config_bytes)?;
             if parsed.recorder_public_key != self.config.recorder_public_key {
                 return Err("the installed configuration names a different recorder key; key rotation is not supported".to_string());
+            }
+            if parsed.gate_public_key != self.config.gate_public_key {
+                return Err("the installed configuration names a different gate key; key rotation is not supported".to_string());
             }
             new_config = Some(parsed);
             changes.push(json!({"target": "config", "expected": self.state.config_sha256, "measured": sha}));
@@ -704,7 +724,7 @@ impl Recorder {
             if names(&c) != names(&self.config) {
                 return Err(Fail::Rejected("the set of software components is fixed at genesis".to_string()));
             }
-            if c.recorder_public_key != self.config.recorder_public_key {
+            if c.recorder_public_key != self.config.recorder_public_key || c.gate_public_key != self.config.gate_public_key {
                 return Err(Fail::Rejected("key rotation is not supported".to_string()));
             }
             new_config = Some(c);
@@ -788,6 +808,59 @@ impl Recorder {
         }
         self.append("heartbeat", Map::new()).map_err(|e| self.enter_fault("append", e))?;
         Ok(true)
+    }
+
+    /// Section 4.5: take a receipt the gate signed and write it into the journal as a
+    /// record of its own. Returns the record's number and the receipt's.
+    ///
+    /// The recorder checks two things before it writes: that the receipt is signed with
+    /// the gate key the configuration names, and that its number is higher than the last
+    /// one written, so that a receipt sent twice, or made by another node, is not
+    /// written. It does not judge what the receipt says. That is the verifier's work.
+    pub fn gate_receipt(&mut self, receipt: &Value) -> Result<(usize, u64), Fail> {
+        if self.stopped {
+            return Err(Fail::Rejected("the recorder has stopped".to_string()));
+        }
+        if let Some(why) = self.fault.clone() {
+            return Err(Fail::Fault(why));
+        }
+        let Some(gate_key) = self.config.gate_public_key.clone() else {
+            return Err(Fail::Rejected("the configuration names no gate key".to_string()));
+        };
+        let fields = object(Some(receipt), "a receipt")?;
+        if fields.get("schema").and_then(Value::as_str) != Some(GATE_RECEIPT_SCHEMA) {
+            return Err(Fail::Rejected(format!("a receipt's schema must be {GATE_RECEIPT_SCHEMA}")));
+        }
+        let Some(seq) = fields.get("seq").and_then(Value::as_u64) else {
+            return Err(Fail::Rejected("a receipt needs its number, seq".to_string()));
+        };
+        let mut unsigned = fields.clone();
+        let sig = unsigned.remove("sig");
+        let text = canonical(&Value::Object(unsigned)).map_err(|e| Fail::Rejected(format!("receipt: {e}")))?;
+        if !signing::verify(&gate_key, &text, sig.as_ref().and_then(Value::as_str).unwrap_or("")) {
+            return Err(Fail::Rejected("the receipt is not signed by the gate".to_string()));
+        }
+        if self.last_receipt_seq.is_some_and(|last| seq <= last) {
+            return Err(Fail::Rejected(format!("receipt {seq} is not newer than the last one in the journal")));
+        }
+        let mut record = Map::new();
+        record.insert("receipt".into(), Value::Object(fields.clone()));
+        let n = self.append("gate_receipt", record).map_err(|e| self.enter_fault("append", e))?;
+        self.last_receipt_seq = Some(seq);
+        // A receipt that names a command record answers for it, whatever it decided. A
+        // deadman receipt names the gate's head, which it does not answer for.
+        if fields.get("decision").and_then(Value::as_str) != Some("deadman") {
+            if let Some(of) = fields.get("n").and_then(Value::as_u64) {
+                self.awaiting_receipt.remove(&(of as usize));
+            }
+        }
+        Ok((n, seq))
+    }
+
+    /// How many command records this process has forwarded and has no receipt for yet.
+    /// Always 0 when the configuration names no gate key.
+    pub fn receipts_outstanding(&self) -> usize {
+        self.awaiting_receipt.len()
     }
 
     /// The limits for converting a ROS Twist, from the configuration in force.
@@ -1056,6 +1129,118 @@ mod tests {
         // All four commands went to the gate.
         let link = fs::read_to_string(dir.join("link.jsonl")).unwrap();
         assert_eq!(link.matches("\\\"kind\\\":\\\"command\\\"").count(), 4);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A recorder whose configuration names a gate key, and the gate's signing key.
+    fn with_gate_key(name: &str) -> (PathBuf, Recorder, SigningKey) {
+        let dir = std::env::temp_dir().join(format!("sl-{name}-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("recorder.key");
+        let public = signing::generate(&key_file).unwrap();
+        installed(&dir.join("installed"), &public);
+        let gate = SigningKey::from_bytes(&[7u8; 32]);
+        let config = dir.join("installed/config.json");
+        let text = fs::read_to_string(&config)
+            .unwrap()
+            .replace("\"measure_every\":5", &format!("\"measure_every\":50,\"gate_public_key\":\"{}\"", signing::public_hex(&gate)));
+        fs::write(&config, text).unwrap();
+        let clock = Clock::Fixed(parse_at("2026-10-01T08:00:00Z").unwrap());
+        let link = Link::File(dir.join("link.jsonl"));
+        let r = Recorder::open(&dir.join("data"), &dir.join("installed"), &key_file, link, clock).unwrap();
+        (dir, r, gate)
+    }
+
+    fn receipt(key: &SigningKey, seq: u64, decision: &str, reason: Value, n: Value) -> Value {
+        let mut body = json!({"schema": GATE_RECEIPT_SCHEMA, "seq": seq, "decision": decision, "reason": reason,
+            "detail": null, "n": n, "hash": null, "sent": {"speed_mm_s": 0}, "at_ms": null});
+        let sig = signing::sign(key, &canonical(&body).unwrap());
+        body["sig"] = json!(sig);
+        body
+    }
+
+    /// A receipt signed by the gate becomes a signed record of the recorder's, holding the
+    /// receipt whole, and answers for the command it names.
+    #[test]
+    fn a_receipt_signed_by_the_gate_is_written_as_a_record() {
+        let (dir, mut r, gate) = with_gate_key("receipt");
+        let (n, _) = r.command(&json!({"requested": {"speed_mm_s": 1}})).unwrap();
+        assert_eq!(r.receipts_outstanding(), 1);
+        let sent = receipt(&gate, 0, "applied", Value::Null, json!(n));
+        let (at, seq) = r.gate_receipt(&sent).unwrap();
+        assert_eq!((seq, r.receipts_outstanding()), (0, 0));
+        let all = records(&dir);
+        assert_eq!(all[at]["kind"], json!("gate_receipt"));
+        assert_eq!(all[at]["receipt"], sent);
+        assert_eq!(all[at]["sig"].as_str().unwrap().len(), 128);
+        // It went to the gate like every record, so the gate's head covers it.
+        let link = fs::read_to_string(dir.join("link.jsonl")).unwrap();
+        assert_eq!(link.lines().count(), all.len());
+        // The settings in the first record name the gate's key.
+        assert_eq!(all[0]["settings"]["gate_public_key"], json!(signing::public_hex(&gate)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What is not written: a receipt signed with another key, one whose contents were
+    /// changed after signing, one sent twice, and anything that is not a receipt.
+    #[test]
+    fn a_receipt_the_gate_did_not_sign_or_already_sent_is_not_written() {
+        let (dir, mut r, gate) = with_gate_key("badreceipt");
+        let before = records(&dir).len();
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let refused = |r: &mut Recorder, v: &Value| match r.gate_receipt(v) {
+            Err(Fail::Rejected(why)) => why,
+            _ => panic!("expected a rejection"),
+        };
+        assert!(refused(&mut r, &receipt(&other, 0, "applied", Value::Null, json!(2))).contains("not signed by the gate"));
+        let mut changed = receipt(&gate, 0, "refused", json!("age"), json!(2));
+        changed["decision"] = json!("applied");
+        assert!(refused(&mut r, &changed).contains("not signed by the gate"));
+        let mut unsigned = receipt(&gate, 0, "applied", Value::Null, json!(2));
+        unsigned.as_object_mut().unwrap().remove("sig");
+        assert!(refused(&mut r, &unsigned).contains("not signed by the gate"));
+        assert!(refused(&mut r, &json!("receipt")).contains("JSON object"));
+        assert!(refused(&mut r, &json!({"seq": 0})).contains("schema"));
+        assert_eq!(records(&dir).len(), before);
+        assert!(r.fault.is_none());
+
+        r.gate_receipt(&receipt(&gate, 0, "refused", json!("signature"), Value::Null)).unwrap();
+        r.gate_receipt(&receipt(&gate, 1, "refused", json!("chain"), Value::Null)).unwrap();
+        // Sent again, by the gate or by anyone who saw it go past.
+        assert!(refused(&mut r, &receipt(&gate, 1, "refused", json!("chain"), Value::Null)).contains("not newer"));
+        assert!(refused(&mut r, &receipt(&gate, 0, "refused", json!("signature"), Value::Null)).contains("not newer"));
+        assert_eq!(records(&dir).len(), before + 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// After a restart the recorder still knows the last receipt it wrote, from the journal.
+    #[test]
+    fn the_last_receipt_number_is_recovered_from_the_journal() {
+        let (dir, mut r, gate) = with_gate_key("receiptrestart");
+        r.gate_receipt(&receipt(&gate, 0, "refused", json!("form"), Value::Null)).unwrap();
+        r.gate_receipt(&receipt(&gate, 1, "refused", json!("form"), Value::Null)).unwrap();
+        r.stop().unwrap();
+        drop(r);
+        let clock = Clock::Fixed(parse_at("2026-10-01T09:00:00Z").unwrap());
+        let link = Link::File(dir.join("link.jsonl"));
+        let mut r = Recorder::open(&dir.join("data"), &dir.join("installed"), &dir.join("recorder.key"), link, clock).unwrap();
+        assert!(matches!(r.gate_receipt(&receipt(&gate, 1, "refused", json!("form"), Value::Null)), Err(Fail::Rejected(_))));
+        assert!(r.gate_receipt(&receipt(&gate, 2, "refused", json!("form"), Value::Null)).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A machine whose configuration names no gate key takes no receipts and waits for none.
+    #[test]
+    fn without_a_gate_key_no_receipt_is_taken() {
+        let (dir, mut r) = fresh("nogatekey");
+        r.command(&json!({"requested": {"speed_mm_s": 1}})).unwrap();
+        assert_eq!(r.receipts_outstanding(), 0);
+        let gate = SigningKey::from_bytes(&[7u8; 32]);
+        match r.gate_receipt(&receipt(&gate, 0, "applied", Value::Null, json!(2))) {
+            Err(Fail::Rejected(why)) => assert!(why.contains("no gate key")),
+            _ => panic!("expected a rejection"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

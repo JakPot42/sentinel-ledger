@@ -4,6 +4,7 @@
 //!   cmd_vel_in        geometry_msgs/Twist  in   the command a controller requests
 //!   safety_inputs     std_msgs/String      in   JSON object of integers, e.g. {"light_curtain_clear":1}
 //!   recorder_control  std_msgs/String      in   JSON: {"op":"declare",...} | {"op":"measure"} | {"op":"stop"}
+//!   gate_receipts     std_msgs/String      in   a receipt signed by the gate, written to the journal as a record
 //!   cmd_vel_out       std_msgs/String      out  one message per record: its text, number and hash
 //!   recorder_status   std_msgs/String      out  one JSON reply for each input handled
 //!
@@ -37,6 +38,44 @@ struct Shared {
     /// treat a missing input as unsafe.
     inputs: Map<String, Value>,
     handled: u64,
+    /// A stop was asked for while commands were still waiting for the gate's receipt.
+    /// The stop record is written when the last receipt is in, or at this time.
+    stop_by: Option<Instant>,
+}
+
+/// How long a stop waits for the receipts of commands already forwarded.
+const STOP_WAITS_FOR_RECEIPTS: Duration = Duration::from_secs(2);
+
+/// Write the stop record and say how it went. Returns the reply and the exit code.
+fn stop_now(s: &mut Shared, failed: &Mutex<Vec<(usize, String)>>) -> (Value, i32) {
+    s.stop_by = None;
+    // Anchor failures not yet in the journal go in before the stop record.
+    for (covered, why) in failed.lock().unwrap().drain(..) {
+        s.recorder.anchor_failed(covered, why);
+    }
+    let without_receipt = s.recorder.receipts_outstanding();
+    if s.recorder.fault.is_some() {
+        return (json!({"ok": false, "fault": true, "stopped": true}), 3);
+    }
+    match s.recorder.stop() {
+        Ok((root, entries)) => {
+            (json!({"ok": true, "stopped": true, "root": root, "entries": entries, "commands_without_receipt": without_receipt}), 0)
+        }
+        Err(e) => (json!({"ok": false, "fault": true, "stopped": true, "error": e}), 3),
+    }
+}
+
+/// Finish a stop that was waiting for receipts, if it need wait no longer.
+fn finish_stop(s: &mut Shared, failed: &Mutex<Vec<(usize, String)>>, stop: &AtomicI32, tell: &dyn Fn(Value)) {
+    let Some(by) = s.stop_by else { return };
+    if s.recorder.receipts_outstanding() > 0 && Instant::now() < by && s.recorder.fault.is_none() {
+        return;
+    }
+    let (mut v, code) = stop_now(s, failed);
+    v["kind"] = json!("stop");
+    v["handled"] = json!(s.handled);
+    stop.store(code, Ordering::SeqCst);
+    tell(v);
 }
 
 /// Timings for diagnosis, written only when SL_TRACE_FILE is set. Each line carries the
@@ -219,7 +258,7 @@ fn run() -> Result<i32, String> {
     if recorder.twist_limits().is_none() {
         return Err("the configuration has no twist_limits".to_string());
     }
-    let shared = Arc::new(Mutex::new(Shared { recorder, inputs: Map::new(), handled: 0 }));
+    let shared = Arc::new(Mutex::new(Shared { recorder, inputs: Map::new(), handled: 0, stop_by: None }));
 
     let (s, tell, tracing) = (Arc::clone(&shared), say.clone(), trace.clone());
     let _commands = node
@@ -273,6 +312,26 @@ fn run() -> Result<i32, String> {
         .map_err(|e| e.to_string())?;
 
     let stop = Arc::new(AtomicI32::new(RUNNING));
+
+    // The gate's receipts (section 4.5). Each one that is signed by the gate and newer
+    // than the last becomes a record. The topic is the robot's to publish on, and any
+    // node can: what is not the gate's is not written.
+    let (s, tell, stopping) = (Arc::clone(&shared), say.clone(), Arc::clone(&stop));
+    let failed = Arc::clone(&anchor_failures);
+    let _receipts = node
+        .create_subscription::<Text, _>("gate_receipts".keep_last(1000).reliable().transient_local(), move |msg: Text| {
+            let mut s = s.lock().unwrap();
+            s.handled += 1;
+            let receipt: Value = serde_json::from_str(&msg.data).unwrap_or(Value::Null);
+            let of = receipt.get("n").cloned().unwrap_or(Value::Null);
+            let mut v = reply(s.recorder.gate_receipt(&receipt).map(|(n, seq)| json!({"n": n, "seq": seq, "of": of})));
+            v["kind"] = json!("gate_receipt");
+            v["handled"] = json!(s.handled);
+            tell(v);
+            finish_stop(&mut s, &failed, &stopping, &tell);
+        })
+        .map_err(|e| e.to_string())?;
+
     let (s, tell, stopping, tracing) = (Arc::clone(&shared), say.clone(), Arc::clone(&stop), trace.clone());
     let failed = Arc::clone(&anchor_failures);
     let _control = node
@@ -287,25 +346,17 @@ fn run() -> Result<i32, String> {
                 "declare" => reply(s.recorder.declare(&op).map(|n| json!({"n": n}))),
                 "measure" => reply(s.recorder.measure().map(|_| json!({})).map_err(Fail::Fault)),
                 "stop" => {
-                    // Anchor failures not yet in the journal go in before the stop record.
-                    for (covered, why) in failed.lock().unwrap().drain(..) {
-                        s.recorder.anchor_failed(covered, why);
+                    if s.recorder.receipts_outstanding() > 0 && s.recorder.fault.is_none() {
+                        // Commands have gone to the gate whose receipts are not back yet.
+                        // Nothing is written after the stop record, so the stop waits for
+                        // them, for a bounded time. The reply is sent when it is done.
+                        s.stop_by = Some(Instant::now() + STOP_WAITS_FOR_RECEIPTS);
+                        tracing.line("control", json!({"op": name, "waiting_for_receipts": s.recorder.receipts_outstanding()}));
+                        return;
                     }
-                    if s.recorder.fault.is_some() {
-                        stopping.store(3, Ordering::SeqCst);
-                        json!({"ok": false, "fault": true, "stopped": true})
-                    } else {
-                        match s.recorder.stop() {
-                            Ok((root, entries)) => {
-                                stopping.store(0, Ordering::SeqCst);
-                                json!({"ok": true, "stopped": true, "root": root, "entries": entries})
-                            }
-                            Err(e) => {
-                                stopping.store(3, Ordering::SeqCst);
-                                json!({"ok": false, "fault": true, "stopped": true, "error": e})
-                            }
-                        }
-                    }
+                    let (v, code) = stop_now(&mut s, &failed);
+                    stopping.store(code, Ordering::SeqCst);
+                    v
                 }
                 _ => json!({"ok": false, "fault": false, "error": "unknown op"}),
             };
@@ -323,7 +374,7 @@ fn run() -> Result<i32, String> {
     // Two earlier versions did (a check between calls to spin with a timeout, then a ROS
     // timer) and both missed heartbeats, because the executor did not always wake until
     // a message arrived.
-    let (s, tell, tracing) = (Arc::clone(&shared), say.clone(), trace.clone());
+    let (s, tell, tracing, stopping) = (Arc::clone(&shared), say.clone(), trace.clone(), Arc::clone(&stop));
     let failed = Arc::clone(&anchor_failures);
     std::thread::spawn(move || loop {
         let slept_from = Instant::now();
@@ -338,6 +389,8 @@ fn run() -> Result<i32, String> {
             s.recorder.anchor_failed(covered, why);
         }
         let result = s.recorder.record_pending().and_then(|_| s.recorder.heartbeat_if_due());
+        // A stop that has waited long enough for receipts goes ahead without them.
+        finish_stop(&mut s, &failed, &stopping, &tell);
         let hold = locked.elapsed();
         drop(s);
         // One line for every heartbeat written, and one for any pass that overslept or

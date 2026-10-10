@@ -70,11 +70,22 @@ def test_a_six_second_flush_stops_the_robot_and_is_stated_in_the_journal(ros_nod
     the robot at four seconds. The command, six seconds old when its record lands, is
     refused for its age and the robot stays stopped. The recorder writes a record stating
     the stall, and the verifier reports STORAGE_STALL: a finding, exit 2, and not an
-    unexplained gap."""
+    unexplained gap.
+
+    The refusal is in the journal: the gate signs a receipt saying it refused that record
+    for its age, the recorder writes the receipt down as a record, and the verifier
+    reports GATE_REFUSED with the reason, in its JSON and in the text a person reads.
+    Before receipts the journal showed that command as recorded and forwarded, and
+    nothing else."""
     code, observed = run(11, ros_node(), tmp_path, slow_flush_node=ros_node("test-slow-flush"))
     want = expected(11)
     assert {k: observed.get(k) for k in want} == want
     assert code == 0
+    assert observed["age_refusal_in_journal"] is True and observed["verifier_output_shows_it"] is True
+    assert "GATE_REFUSED" in observed["findings"] and "refused:age" in observed["receipts"]
+    with open(os.path.join(str(tmp_path), "ros_scenario_11", "verifier_output.txt"), encoding="utf-8") as fh:
+        report = fh.read()
+    assert '  GATE_REFUSED n=' in report and 'reason="age"' in report and "ms old; the limit is 1000 ms" in report
 
 
 def test_the_slow_flush_switch_does_nothing_in_a_normal_build(ros_node, tmp_path):
@@ -125,7 +136,12 @@ def test_planted_bug_node_drops_a_record(ros_node, tmp_path):
     code, observed = run(1, ros_node("planted-bug-ros-drops-a-record"), tmp_path)
     assert code == 2
     assert observed["robot_exit"] == 2
-    assert observed["verifier_exit"] == 0  # the journal itself is whole
+    # The journal is whole, and it now says what the gate did: it holds the gate's signed
+    # refusals, and the commands that were refused have no receipt saying they were applied.
+    # With every record refused, no valid record arrives, and the deadman trips as well.
+    assert observed["verifier_exit"] == 2
+    assert observed["findings"] == ["COMMAND_WITHOUT_RECEIPT", "GATE_DEADMAN", "GATE_REFUSED"]
+    assert "refused:chain" in observed["receipts"] and "deadman" in observed["receipts"]
     assert [why for why, _ in observed["sent"] if why == "applied"] == [] or \
         len([why for why, _ in observed["sent"] if why == "applied"]) < 5
     assert ["gate_refused", 0] in observed["sent"]
@@ -220,12 +236,85 @@ def test_planted_bug_gate_does_not_check_a_commands_age(ros_node, tmp_path):
     assert observed["stale_refusals"] == 0
     # The stale command moved the robot.
     assert observed["sent"] == [["applied", 500], ["deadman", 0], ["applied", 200], ["applied", 300]]
-    # The journal is the same either way: the stall is stated. Only the robot differs.
-    assert observed["findings"] == ["STORAGE_STALL"]
+    # The stall is stated either way. But the journal now tells the two gates apart: this
+    # one's receipt says it applied the old command, where the real gate's says refused.
+    assert observed["findings"] == ["GATE_DEADMAN", "STORAGE_STALL"]
+    assert observed["receipts"] == ["applied", "deadman", "applied", "applied"]
 
     code, observed = run(11, ros_node(), tmp_path, slow_flush_node=slow)
     assert code == 0 and observed["stale_refusals"] == 1
     assert ["applied", 200] not in observed["sent"]
+    assert observed["receipts"] == ["applied", "deadman", "refused:age", "applied"]
+
+
+def test_planted_bug_gate_drops_the_receipts_for_its_refusals(ros_node, tmp_path):
+    """The gate refuses as it should and keeps quiet about it: every receipt for a refusal
+    is dropped before it is sent. The robot behaves exactly as before. The journal is what
+    turns red.
+
+    Scenario 11: the command refused for its age has no receipt, and the gate's receipt
+    numbers skip one. The verifier reports both. It cannot say the command was refused,
+    because nothing in the journal says so; it says the journal does not account for it.
+
+    Scenario 7: the forged record was never a command of the recorder's, so no command is
+    left without a receipt. The gap in the gate's numbers still shows.
+
+    Planted the same way as the other gate bugs: a copy of the gate with one line changed,
+    after proving the line was there to change."""
+    broken = tmp_path / "gate_that_hides_refusals"
+    broken.mkdir()
+    with open(os.path.join(REPO, "gate", "actuator_gate.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    line = "        return signed\n"
+    assert source.count(line) == 1
+    (broken / "actuator_gate.py").write_text(
+        source.replace(line, '        return None if signed["decision"] == "refused" else signed\n'), encoding="utf-8")
+
+    slow = ros_node("test-slow-flush")
+    code, observed = run(11, ros_node(), tmp_path, slow_flush_node=slow, SL_GATE_DIR=str(broken))
+    assert code == 2
+    # The robot did the right thing: stopped by the deadman, the stale command not carried out.
+    assert observed["sent"] == [["applied", 500], ["deadman", 0], ["stale_command", 0], ["applied", 300]]
+    assert observed["stale_refusals"] == 1
+    # The journal has no receipt for the refused command, and the verifier says so.
+    assert observed["receipts"] == ["applied", "deadman", "applied"]
+    assert observed["age_refusal_in_journal"] is False and observed["verifier_reports_the_age_refusal"] is False
+    assert observed["verifier_exit"] == 2
+    assert observed["findings"] == ["COMMAND_WITHOUT_RECEIPT", "GATE_DEADMAN", "RECEIPT_MISSING", "STORAGE_STALL"]
+
+    code, observed = run(7, ros_node(), tmp_path, SL_GATE_DIR=str(broken))
+    assert code == 2
+    assert observed["forged"] == [False, "gate_refused"] and ["applied", 1500] not in observed["sent"]
+    assert observed["receipts"] == ["applied", "applied"]
+    assert observed["verifier_exit"] == 2 and observed["findings"] == ["RECEIPT_MISSING"]
+
+    # The same two scenarios with the real gate, so the difference is the one line.
+    code, observed = run(11, ros_node(), tmp_path, slow_flush_node=slow)
+    assert code == 0 and "GATE_REFUSED" in observed["findings"] and "RECEIPT_MISSING" not in observed["findings"]
+    code, observed = run(7, ros_node(), tmp_path)
+    assert code == 0 and observed["findings"] == ["GATE_REFUSED"]
+
+
+def test_planted_bug_gate_signs_no_receipts(ros_node, tmp_path):
+    """The gate with its receipts removed, which is the gate as it was. The robot moves as
+    commanded. Every command record is in the journal with nothing to say what the gate
+    did with it, and the verifier reports each one."""
+    broken = tmp_path / "gate_without_receipts"
+    broken.mkdir()
+    with open(os.path.join(REPO, "gate", "actuator_gate.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    check = "        if self.gate_key is None or about is None:"
+    assert source.count(check) == 1
+    (broken / "actuator_gate.py").write_text(source.replace(check, "        if True:"), encoding="utf-8")
+
+    code, observed = run(3, ros_node(), tmp_path, SL_GATE_DIR=str(broken))
+    assert code == 2
+    assert observed["sent"] == [["blocked", 0], ["applied", 500], ["blocked", 0], ["applied", 500]]
+    assert observed["receipts"] == []
+    assert observed["verifier_exit"] == 2 and observed["findings"] == ["COMMAND_WITHOUT_RECEIPT"]
+
+    code, observed = run(3, ros_node(), tmp_path)
+    assert code == 0 and observed["receipts"] == ["blocked", "applied", "blocked", "applied"]
 
 
 @pytest.mark.skipif(False, reason="always runs")

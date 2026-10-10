@@ -7,14 +7,16 @@ library, so it can be read, audited and run on its own.
 
     verify_journal.py JOURNAL --rulesets DIR [--root HEX] [--witness-store FILE]
                       [--anchors DIR] [--gate-state FILE] [--decisions DIR] [--public-key HEX]
+                      [--gate-public-key HEX]
                       [--profile FILE --as-of YYYY-MM-DD] [--json]
     verify_journal.py --receipt FILE --root HEX
 
 Three levels, and it stops at the first one that fails:
   1. the chain: every leaf hash, then the Merkle root (LogChain format version 2), then
      every anchored root it was given and the head the actuator-side gate holds;
-  2. the records: position, order, each record's signature, the state in force, and
-     which rule acted;
+  2. the records: position, order, each record's signature, the state in force, which
+     rule acted, and the gate's receipts: every refusal, every deadman trip, every
+     command with no receipt and every gap in the gate's numbering is a finding;
   3. a profile, when one is given: which records it maps to a rule, and retention.
 
 Exit codes: 0 clean, 2 at least one finding, 1 usage or I/O error.
@@ -31,9 +33,12 @@ import sys
 
 SCHEMA = "sentinel-ledger/record/0"
 RECEIPT_SCHEMA = "sentinel-ledger/receipt/0"
+GATE_RECEIPT_SCHEMA = "sentinel-ledger/gate-receipt/0"
 PROFILE_SCHEMA = "sentinel-ledger/profile/0"
 KINDS = ("genesis", "recorder_start", "recorder_stop", "command", "intervention_declared",
-         "intervention_detected", "heartbeat", "recorder_fault", "storage_stall", "anchor_failed")
+         "intervention_detected", "heartbeat", "recorder_fault", "storage_stall", "anchor_failed",
+         "gate_receipt")
+REFUSAL_REASONS = ("age", "signature", "chain", "form")
 AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 OPS = {"lt": lambda a, b: a < b, "le": lambda a, b: a <= b, "eq": lambda a, b: a == b,
@@ -394,7 +399,51 @@ def good_state(state):
 def good_settings(settings):
     return (isinstance(settings, dict) and type(settings.get("heartbeat_seconds")) is int
             and settings["heartbeat_seconds"] > 0 and isinstance(settings.get("recorder_public_key"), str)
-            and HEX64.match(settings["recorder_public_key"]) is not None)
+            and HEX64.match(settings["recorder_public_key"]) is not None
+            and ("gate_public_key" not in settings or (isinstance(settings["gate_public_key"], str)
+                                                       and HEX64.match(settings["gate_public_key"]) is not None)))
+
+
+def bad_receipt(r):
+    """None, or why the object in a gate_receipt record is not a receipt. SPEC 4.5."""
+    if not isinstance(r, dict) or r.get("schema") != GATE_RECEIPT_SCHEMA:
+        return "the record holds no receipt of schema " + GATE_RECEIPT_SCHEMA
+    if type(r.get("seq")) is not int or r["seq"] < 0:
+        return "the receipt has no number"
+    decision, reason, n = r.get("decision"), r.get("reason"), r.get("n")
+    if decision not in ("applied", "blocked", "refused", "deadman"):
+        return "unknown decision %r" % (decision,)
+    if decision == "refused" and reason not in REFUSAL_REASONS:
+        return "a refusal with no reason this specification defines"
+    if decision != "refused" and reason is not None:
+        return "a reason on a receipt that is not a refusal"
+    names_a_record = decision != "refused" or reason == "age"
+    if names_a_record and (type(n) is not int or not isinstance(r.get("hash"), str)):
+        return "the receipt does not name a record"
+    if not names_a_record and (n is not None or r.get("hash") is not None):
+        return "a refusal for %s must not name a record" % reason
+    if r.get("detail") is not None and not isinstance(r["detail"], str):
+        return "detail must be text or null"
+    return None
+
+
+def receipt_fits(r, position, records, hashes, receipted):
+    """None, or why a receipt that names a command record does not belong to it."""
+    n = r["n"]
+    if n < 0 or n >= position:
+        return "it names record %d, which is not before it in the journal" % n
+    if records[n] is None or records[n]["kind"] != "command":
+        return "it names record %d, which is not a command" % n
+    if hashes[n] != r["hash"]:
+        return "the hash it names is not the hash of record %d" % n
+    if n in receipted:
+        return "record %d already has a receipt" % n
+    command = records[n]
+    if r["decision"] == "applied" and (command.get("outcome") == "blocked" or r.get("sent") != command.get("applied")):
+        return "it says the gate applied something other than the record's applied command"
+    if r["decision"] == "blocked" and command.get("outcome") != "blocked":
+        return "it says the record was a blocked command, and it was not"
+    return None
 
 
 def good_stall(rec):
@@ -426,24 +475,30 @@ def good_command(rec):
     return None
 
 
-def check_records(entries, rulesets, decisions_dir, expected_key=None):
+def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_gate_key=None):
     findings = []
     counts = {"records": len(entries), "commands": 0, "unchanged": 0, "changed": 0, "blocked": 0,
               "not_recomputed": 0, "interventions_declared": 0, "interventions_detected": 0,
               "heartbeats": 0, "recorder_faults": 0, "storage_stalls": 0, "anchors_failed": 0,
-              "restarts_without_stop": 0,
+              "restarts_without_stop": 0, "gate_receipts": 0, "gate_refusals": 0, "gate_deadman_trips": 0,
+              "commands_without_receipt": 0,
               "decisions_named": 0, "decisions_checked": 0, "decision_absent": 0, "signatures_checked": 0}
     downtime = []
     records = []
     parsed_rulesets = {}
-    state = settings = key = None
+    state = settings = key = gate_key = None
     prev_hash, prev_at, prev_kind = "", None, None
+    # The gate's receipts (SPEC 4.5): the leaf hash of every record, the commands recorded
+    # while the settings named a gate key, those a receipt has answered for, and the
+    # number of the last receipt seen.
+    hashes, wants_receipt, receipted, last_seq = [], [], set(), None
 
     def add(kind, n, **more):
         findings.append(dict({"finding": kind, "n": n}, **more))
 
     for position, entry in enumerate(entries):
         this_hash = leaf_hash(entry["raw"].encode("utf-8")).hex()
+        hashes.append(this_hash)
         try:
             rec = parse_record(entry["raw"])
         except ValueError as exc:
@@ -480,8 +535,11 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None):
             if good_state(rec.get("state")) and good_settings(rec.get("settings")):
                 state, settings = json.loads(canonical(rec["state"])), rec["settings"]
                 key = settings["recorder_public_key"]
+                gate_key = settings.get("gate_public_key")
                 if expected_key is not None and key != expected_key:
                     add("KEY_MISMATCH", position, journal_key=key, expected_key=expected_key)
+                if expected_gate_key is not None and gate_key != expected_gate_key:
+                    add("KEY_MISMATCH", position, journal_gate_key=gate_key, expected_gate_key=expected_gate_key)
             else:
                 add("RECORD_MALFORMED", position, reason="genesis lacks a usable state or settings")
         # Every record, the first included, must be signed with the key the first record names.
@@ -508,6 +566,38 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None):
                 # The recorder states that an anchor statement could not be written. The
                 # records it would have covered have one piece of outside evidence fewer.
                 add("ANCHOR_FAILED", position, entry_count=rec["entry_count"], detail=rec["detail"])
+        elif kind == "gate_receipt":
+            counts["gate_receipts"] += 1
+            r = rec.get("receipt")
+            problem = bad_receipt(r) or (None if gate_key is not None else "the settings name no gate key")
+            if problem:
+                add("RECEIPT_INVALID", position, reason=problem)
+            elif not signature_ok(r, gate_key):
+                add("RECEIPT_INVALID", position, reason="the receipt is not signed with the gate's key")
+            else:
+                # The gate numbers its receipts from 0. A number skipped is a receipt the
+                # gate issued and the journal does not hold.
+                expected = 0 if last_seq is None else last_seq + 1
+                if r["seq"] > expected:
+                    add("RECEIPT_MISSING", position, missing=r["seq"] - expected, first_missing=expected,
+                        next_in_journal=r["seq"])
+                elif r["seq"] < expected:
+                    add("RECEIPT_INVALID", position, reason="receipt %d follows receipt %d" % (r["seq"], last_seq))
+                last_seq = r["seq"] if last_seq is None else max(last_seq, r["seq"])
+                if r["decision"] == "deadman":
+                    counts["gate_deadman_trips"] += 1
+                    add("GATE_DEADMAN", position, gate_seq=r["seq"], last_record_accepted=r["n"], detail=r["detail"])
+                else:
+                    if r["decision"] == "refused":
+                        counts["gate_refusals"] += 1
+                        add("GATE_REFUSED", position, gate_seq=r["seq"], reason=r["reason"], of_record=r["n"],
+                            detail=r["detail"])
+                    if r["n"] is not None:
+                        misfit = receipt_fits(r, position, records, hashes, receipted)
+                        if misfit:
+                            add("RECEIPT_MISMATCH", position, of_record=r["n"], reason=misfit)
+                        else:
+                            receipted.add(r["n"])
         elif kind == "storage_stall":
             counts["storage_stalls"] += 1
             if not good_stall(rec):
@@ -539,12 +629,16 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None):
                     if change["target"] == "config":
                         if good_settings(rec.get("settings")) and rec["settings"]["recorder_public_key"] != key:
                             add("RECORD_MALFORMED", position, reason="a change of the recorder's key; key rotation is not supported")
+                        elif good_settings(rec.get("settings")) and rec["settings"].get("gate_public_key") != gate_key:
+                            add("RECORD_MALFORMED", position, reason="a change of the gate's key; key rotation is not supported")
                         elif good_settings(rec.get("settings")):
                             settings = rec["settings"]
                         else:
                             add("RECORD_MALFORMED", position, reason="a configuration change without settings")
         elif kind == "command":
             counts["commands"] += 1
+            if gate_key is not None:
+                wants_receipt.append(position)
             problem = good_command(rec)
             if problem:
                 add("RECORD_MALFORMED", position, reason=problem)
@@ -586,6 +680,12 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None):
                             add("DECISION_MISMATCH", position, decision_sha256=rec["decision_sha256"])
         prev_hash, prev_at, prev_kind = this_hash, rec["at"], kind
 
+    # Where the gate signs receipts, a command with none is a command the journal cannot
+    # say the gate applied, blocked or refused.
+    for position in wants_receipt:
+        if position not in receipted:
+            counts["commands_without_receipt"] += 1
+            add("COMMAND_WITHOUT_RECEIPT", position)
     return findings, counts, downtime, records
 
 
@@ -733,6 +833,9 @@ def show(result):
         if c["recorder_faults"] or c["restarts_without_stop"]:
             out.append("recorder:         %d fault record(s), %d start(s) with no stop before"
                        % (c["recorder_faults"], c["restarts_without_stop"]))
+        if c.get("gate_receipts") or c.get("commands_without_receipt"):
+            out.append("gate receipts:    %d in the journal: %d refusal(s), %d deadman trip(s); %d command(s) with no receipt"
+                       % (c["gate_receipts"], c["gate_refusals"], c["gate_deadman_trips"], c["commands_without_receipt"]))
         if c.get("anchors_failed"):
             out.append("anchors:          %d the recorder states it could not write (each is a finding below)"
                        % c["anchors_failed"])
@@ -823,7 +926,7 @@ def run(args):
     if not findings:
         result["level_reached"] = 2
         findings, result["counts"], result["downtime"], records = check_records(
-            entries, load_rulesets(args.rulesets), args.decisions, args.public_key)
+            entries, load_rulesets(args.rulesets), args.decisions, args.public_key, args.gate_public_key)
         if not findings and profile is not None:
             result["level_reached"] = 3
             findings, provisions = check_profile(profile, records, args.decisions, as_of)
@@ -843,6 +946,8 @@ def main(argv=None):
     ap.add_argument("--gate-state", help="the actuator-side gate's state file; its head must be in the journal")
     ap.add_argument("--public-key", help="the recorder's public key, from the machine's configuration; "
                     "the key the journal names must be this one")
+    ap.add_argument("--gate-public-key", help="the gate's public key, from the machine's configuration; "
+                    "the gate key the journal names must be this one")
     ap.add_argument("--rulesets", help="directory holding the ruleset files the journal names")
     ap.add_argument("--decisions", help="directory holding decision files, named by their SHA-256")
     ap.add_argument("--profile", help="a profile file to report against (level 3)")

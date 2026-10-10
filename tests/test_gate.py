@@ -186,7 +186,7 @@ def test_three_separate_copies_of_the_signature_check_agree_with_rfc_8032():
             assert not verify(ed.public_key(OTHER_SEED), message, signature)
 
 
-def test_the_gate_holds_no_private_key_and_shares_no_code_with_anything_else():
+def test_the_gate_holds_no_key_of_the_recorders_and_shares_no_code_with_anything_else():
     for path in (run_scenarios.GATE, run_scenarios.WITNESS):
         with open(path, encoding="utf-8") as fh:
             source = fh.read()
@@ -194,4 +194,9 @@ def test_the_gate_holds_no_private_key_and_shares_no_code_with_anything_else():
         assert imports <= {"argparse", "datetime", "hashlib", "json", "os", "re", "socketserver", "sys"}, path
     with open(run_scenarios.GATE, encoding="utf-8") as fh:
         gate = fh.read()
-    assert "def sign(" not in gate and "seed" not in gate and "private" not in gate.split("def judge")[1]
+    # The gate has a signing key of its own, for its receipts (tests/test_receipts.py).
+    # The code that judges a record is given the recorder's public key and nothing that
+    # can sign, and the gate's key is used to sign in one place only: a receipt.
+    judging = gate.split("def judge")[1].split("class Gate")[0]
+    assert "gate_key" not in judging and "sign(" not in judging and "private" not in judging
+    assert gate.count("ed25519_sign(") == 2          # its definition, and issue_receipt

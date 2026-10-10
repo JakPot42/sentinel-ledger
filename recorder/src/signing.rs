@@ -50,6 +50,20 @@ pub fn public_hex(key: &SigningKey) -> String {
     hex::encode(key.verifying_key().to_bytes())
 }
 
+/// Whether `signature_hex` is a signature of `text` under the public key `public_hex`.
+/// Used for the gate's receipts, which are signed with the gate's key.
+pub fn verify(public_hex: &str, text: &str, signature_hex: &str) -> bool {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let (Ok(public), Ok(signature)) = (hex::decode(public_hex), hex::decode(signature_hex)) else { return false };
+    let (Ok(public), Ok(signature)) = (<[u8; 32]>::try_from(public), <[u8; 64]>::try_from(signature)) else {
+        return false;
+    };
+    match VerifyingKey::from_bytes(&public) {
+        Ok(key) => key.verify(text.as_bytes(), &Signature::from_bytes(&signature)).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// The signature over `text`, as 128 hexadecimal characters.
 pub fn sign(key: &SigningKey, text: &str) -> String {
     hex::encode(key.sign(text.as_bytes()).to_bytes())

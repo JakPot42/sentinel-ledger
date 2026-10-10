@@ -110,6 +110,10 @@ pub struct Config {
     /// this many milliseconds before it reaches the gate is not carried out. Absent: no
     /// limit (the file demo, whose gate has no clock).
     pub gate_max_command_age_ms: Option<i64>,
+    /// The Ed25519 public key the gate signs its receipts with, 64 hexadecimal characters.
+    /// It is the gate's own key, not the recorder's. Absent: the gate signs no receipts
+    /// and the recorder takes none.
+    pub gate_public_key: Option<String>,
     pub safe_state_action: Value,
     pub software: Vec<SoftwareEntry>,
 }
@@ -136,13 +140,21 @@ impl Config {
                 file: text(s, "file")?,
             });
         }
+        let is_key = |k: &str| k.len() == 64 && k.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
         Ok(Config {
             machine: text(&v, "machine")?,
             heartbeat_seconds: whole("heartbeat_seconds")?,
             measure_every: whole("measure_every")?,
             recorder_public_key: match v.get("recorder_public_key").and_then(Value::as_str) {
-                Some(k) if k.len() == 64 && k.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) => k.to_string(),
+                Some(k) if is_key(k) => k.to_string(),
                 _ => return Err("config needs recorder_public_key: 64 lowercase hexadecimal characters".to_string()),
+            },
+            gate_public_key: match v.get("gate_public_key") {
+                None => None,
+                Some(k) => match k.as_str() {
+                    Some(k) if is_key(k) => Some(k.to_string()),
+                    _ => return Err("gate_public_key must be 64 lowercase hexadecimal characters".to_string()),
+                },
             },
             anchor_every: v.get("anchor_every").and_then(Value::as_i64).unwrap_or(0),
             gate_deadman_seconds: match v.get("gate_deadman_seconds") {
@@ -185,6 +197,9 @@ impl Config {
         }
         if let Some(ms) = self.gate_max_command_age_ms {
             settings["gate_max_command_age_ms"] = json!(ms);
+        }
+        if let Some(key) = &self.gate_public_key {
+            settings["gate_public_key"] = json!(key);
         }
         settings
     }

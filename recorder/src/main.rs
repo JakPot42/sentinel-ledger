@@ -119,6 +119,10 @@ fn run(dir: &Path, installed: &Path, key: &Path, link: &Path, start_at: Option<S
                 recorder.command(&op).map(|(n, outcome)| json!({"ok": true, "n": n, "outcome": outcome}))
             }
             Some("declare") => recorder.declare(&op).map(|n| json!({"ok": true, "n": n})),
+            // A receipt signed by the gate, to be written into the journal (section 4.5).
+            Some("gate_receipt") => recorder
+                .gate_receipt(op.get("receipt").unwrap_or(&Value::Null))
+                .map(|(n, seq)| json!({"ok": true, "n": n, "seq": seq})),
             Some("tick") => recorder
                 .tick(op.get("seconds").and_then(Value::as_i64).unwrap_or(0))
                 .map(|written| json!({"ok": true, "heartbeats": written})),

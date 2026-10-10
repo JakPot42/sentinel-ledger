@@ -21,7 +21,10 @@ disk, and only then send the record to a gate on the actuator's side. The gate p
 command on only if the record is signed by the recorder and extends the chain of records
 it has already seen. In the ROS 2 version the gate also has a deadman (no valid record
 for a configured time means the safe state) and a limit on a command's age (a command
-that reaches it too long after the recorder received it is not carried out).
+that reaches it too long after the recorder received it is not carried out). And the gate
+answers: for every command record, and for every message it refuses, it signs a receipt
+saying what it did, with a key of its own, and the recorder writes that receipt into the
+journal. A command the gate refused is in the journal as refused, with the reason.
 
 Each record holds:
 
@@ -39,7 +42,9 @@ another. The recorder does not say which changes were proper.
 
 A verifier, written in a different language from the recorder and sharing no code with it,
 checks the chain, every signature and every anchored root, replays the journal to work
-out what was in force for each command, and recomputes which rule acted.
+out what was in force for each command, and recomputes which rule acted. Where the gate
+signs receipts, it reports every refusal, every deadman trip, and every command that no
+receipt answers for.
 
 The journal is a [LogChain](https://github.com/JakPot42/logchain) version 2 journal,
 unchanged. `docs/SPEC.md` is the full specification, written so that someone can build a
@@ -112,7 +117,8 @@ publishes only recorded commands on `cmd_vel_out`, each carrying its record's te
 number and hash; a simulated robot, in a separate process, with the gate inside it; a
 heartbeat on its own thread; a deadman in the gate, so that a silent recorder means a
 stopped robot; a limit on a command's age, so that a command held up for seconds is not
-carried out late.
+carried out late; signed receipts from the gate, written into the journal, so that what
+the gate refused and when its deadman tripped are findings in the verifier's report.
 
 What it does not cover:
 
@@ -125,6 +131,27 @@ What it does not cover:
   The demo robot has no such input: its only command input goes into the gate. SROS 2 is
   still not built, set up or tested here.
 - **Any node can stop the robot.** Every message the gate refuses sends the safe state.
+  Each refusal is now in the journal. A bare safe-state message is not: it is not a
+  record, the gate signs no receipt for it, and any node can send one.
+- **A receipt is the gate's word, and it is sent once.** It says what the gate sent to
+  the robot. It does not show that the robot obeyed. If the recorder is stopped, in the
+  safe state or not running when a receipt arrives, the receipt is lost. The verifier
+  then reports a command with no receipt, or a gap in the gate's numbering. That says
+  the journal does not account for something. It does not say what the gate decided.
+- **A dropped receipt is not always seen.** One about a command always is. One for a
+  refusal of a message that was never a record shows only as a gap in the gate's
+  numbering, and only once a later receipt is in the journal. If it was the last
+  receipt the gate issued, nothing shows it.
+- **The gate's key is a second file on the same machine.** Anyone who can read it can
+  make receipts. In every test here both keys belong to one user, so the two signatures
+  separate two components, not two custodians. Kept where the journal's keeper cannot
+  read it, the gate's key would make a refusal something the keeper cannot remove or
+  rewrite unseen. That has not been set up or tested.
+- **Receipts double the writes.** A command is now two records and two flushes to disk.
+  Every message the gate refuses costs it a signature and the journal a record, and
+  nothing limits how fast another node can cause them.
+- **The file demo has no receipts.** Its configuration names no gate key, and nothing
+  carries a receipt back while that recorder runs.
 - **The deadman is only as good as the robot's own timer.** The simulated robot is one
   thread and checks twenty times a second. Anything slow on the robot's side delays the
   check. In a real controller the deadman belongs on a timer of its own. The file demo's
@@ -139,6 +166,8 @@ What it does not cover:
 - **Decision data, the witness and timestamps are not wired into the ROS scenarios.**
 - **Follow-up, not built:** a custom message type for `cmd_vel_out` in place of JSON in a
   `std_msgs/String`.
+- **Follow-up, not built:** the gate re-checking speed limits itself, independent of the
+  recorder's ruleset. Today the gate applies whatever a validly signed record says.
 - Tested with ROS 2 Lyrical and rclrs 0.8 only, in simulation, on one machine.
 
 ## The five scenarios
@@ -221,32 +250,103 @@ input.
 | 3 | a command before any safety signal, then a broken light curtain: both blocked, robot gets zero velocity | 0 | 0 | 0 |
 | 4 | a ruleset upload through the node; firmware changed between two launches and found at the second start | 0, 0 | 0, 0 | 0 |
 | 5 | the journal becomes unwritable: the command is not published; then both are restarted | 3, then 0 | 0, 0 | 0, then 2 (`HEARTBEAT_GAP`: the time the recorder was down) |
-| 6 | another node publishes to `cmd_vel_out`: no record, not JSON, a replay, a tampered record, a gap | 0 | 2: all five refused | 0 |
-| 7 | another node forges a correctly chained record, with a signature lifted from a real one | 0 | 2: refused, the robot does not move | 0 |
-| 8 | the same, signed with a key of the forger's own | 0 | 2: refused, the robot does not move | 0 |
-| 9 | the same, with the signature removed | 0 | 2: refused, the robot does not move | 0 |
-| 10 | the recorder goes silent for ten seconds while the robot is moving at 0.5 m/s (its process is frozen) | 0 | 0: the deadman stops the robot after four seconds | 2 (`HEARTBEAT_GAP`: nothing the recorder wrote explains the silence) |
-| 11 | one record takes six seconds to reach the disk (a test build of the node that can be told to do this) | 0 | 2: the deadman stops the robot at four seconds; the command, six seconds old when its record lands, is refused for its age and the robot stays stopped | 2 (`STORAGE_STALL`: the recorder's next record states the stall and its measured length) |
+| 6 | another node publishes to `cmd_vel_out`: no record, not JSON, a replay, a tampered record, a gap | 0 | 2: all five refused | 2 (`GATE_REFUSED` five times: the journal holds the gate's receipt for each, reasons `form`, `form`, `chain`, `form`, `signature`) |
+| 7 | another node forges a correctly chained record, with a signature lifted from a real one | 0 | 2: refused, the robot does not move | 2 (`GATE_REFUSED`, reason `signature`) |
+| 8 | the same, signed with a key of the forger's own | 0 | 2: refused, the robot does not move | 2 (`GATE_REFUSED`, reason `signature`) |
+| 9 | the same, with the signature removed | 0 | 2: refused, the robot does not move | 2 (`GATE_REFUSED`, reason `signature`) |
+| 10 | the recorder goes silent for ten seconds while the robot is moving at 0.5 m/s (its process is frozen) | 0 | 0: the deadman stops the robot after four seconds | 2 (`HEARTBEAT_GAP`: nothing the recorder wrote explains the silence; `GATE_DEADMAN`: the gate's receipt for the trip, written once the recorder is back) |
+| 11 | one record takes six seconds to reach the disk (a test build of the node that can be told to do this) | 0 | 2: the deadman stops the robot at four seconds; the command, six seconds old when its record lands, is refused for its age and the robot stays stopped | 2 (`STORAGE_STALL`: the recorder's next record states the stall and its measured length; `GATE_DEADMAN`; `GATE_REFUSED`, reason `age`, naming the record that was refused) |
 | 12 | the folder for anchor statements becomes unwritable | 0: not a fault, every command goes out | 0 | 2 (`ANCHOR_FAILED`: a signed record states each statement that could not be written) |
 
 In scenarios 6 to 9 the recorder's own next command is still accepted after the refusals.
 The robot exits 2 in those scenarios because exit 2 means the gate refused something,
 which is the expected result there, and in scenario 11 because it refused a stale
-command. In scenarios 10 to 12 the verifier exits 2 because that is what happened: the
-recorder could not record for a time, or lost an anchor, and the journal says so.
+command. The verifier exits 2 in the same scenarios for the same reason: the journal now
+holds the gate's signed receipt for each refusal, and a refusal is a finding. The
+journal's chain, signatures and rules are sound in all of them. In scenarios 10 to 12
+the verifier exits 2 because that is what happened: the recorder could not record for a
+time, or lost an anchor, and the journal says so.
 
-Six planted bugs on the ROS path. Three are Cargo features of the node. The other three
+Every scenario also checks the receipts the journal ends up holding, in order: one
+`applied` or `blocked` for each command in scenarios 1 to 5 and 12, and the refusals and
+deadman trips in the others.
+
+### Receipts from the gate
+
+Until this was built, a command the gate refused for its age still read in the journal
+as recorded and forwarded, and the verifier had no finding for it. The refusal was only
+in the robot's own log.
+
+Now the gate signs a receipt for every command record it takes in (`applied`, `blocked`,
+or `refused` for `age`), for every message it refuses (`refused` for `signature`, `chain`
+or `form`, meaning not a well-formed record message), and for every deadman trip. It
+signs with a key of its own, whose public half is `gate_public_key` in the machine's
+configuration. The robot publishes each receipt on `gate_receipts`. The recorder checks
+that the gate signed it and that it is newer than the last one, and writes it into the
+journal as a record of its own, signed and chained like the rest. The gate acts first and
+signs afterwards, so a stop is not delayed by a signature.
+
+Those four reasons are the four checks the gate makes. It has no speed limit of its own:
+limits are the ruleset's, applied before the record is written and recomputed by the
+verifier.
+
+Scenario 11's journal, from one run:
+
+```
+ 2  command        applied 500 mm/s
+ 3  gate_receipt   receipt 0: applied, record 2
+ 4  command        applied 200 mm/s           (this record took six seconds to write)
+ 5  storage_stall  record 4, 6000 ms
+ 6  gate_receipt   receipt 1: deadman, "no valid record for 4.041 s; the limit is 4 s"
+ 7  gate_receipt   receipt 2: refused, age, record 4, "the command is 6003 ms old; the limit is 1000 ms"
+ 8  command        applied 300 mm/s
+ 9  gate_receipt   receipt 3: applied, record 8
+```
+
+and the end of the verifier's report on it:
+
+```
+gate receipts:    4 in the journal: 1 refusal(s), 1 deadman trip(s); 0 command(s) with no receipt
+storage stalls:   1 stated by the recorder (each is a finding below)
+  STORAGE_STALL n=5 step="journal_write" of_record=4 stalled_ms=6000 previous="2026-10-10T14:27:45Z" at="2026-10-10T14:27:51Z"
+  GATE_DEADMAN n=6 gate_seq=1 last_record_accepted=3 detail="no valid record for 4.041 s; the limit is 4 s"
+  GATE_REFUSED n=7 gate_seq=2 reason="age" of_record=4 detail="the command is 6003 ms old; the limit is 1000 ms"
+3 FINDING(S)
+```
+
+Record 4 reads as it always did: 200 requested, 200 applied. Record 7 is what says the
+robot never did it.
+
+What the verifier reports about receipts:
+
+| finding | when |
+|---|---|
+| `GATE_REFUSED` | a receipt says the gate refused something, with the reason and, for `age`, the record refused |
+| `GATE_DEADMAN` | a receipt says the gate's deadman tripped |
+| `COMMAND_WITHOUT_RECEIPT` | a command record that no receipt answers for |
+| `RECEIPT_MISSING` | the gate's receipt numbers skip one or more |
+| `RECEIPT_INVALID` | a receipt record that is malformed or not signed with the gate's key |
+| `RECEIPT_MISMATCH` | a receipt the gate signed that does not belong to the record it names |
+
+`tests/test_receipts.py` runs the recorder and the gate with no ROS and covers the rest:
+someone who holds the recorder's key and not the gate's rewrites a refusal as `applied`
+(`RECEIPT_INVALID`), or deletes it and repairs the chain (`COMMAND_WITHOUT_RECEIPT`,
+`RECEIPT_MISSING`); a receipt signed with another key, or sent twice, is not written.
+
+Eight planted bugs on the ROS path. Three are Cargo features of the node. The other five
 are in the gate, which is Python: the test hands the robot a copy of the gate with one
 line changed.
 
 | planted bug | scenario | what turns red |
 |---|---|---|
 | the node stops refusing NaN, infinity and over-limit values | 2 | the scenario driver exits 2: seven commands recorded where four were expected |
-| the node records a command and never publishes it | 1 | the robot exits 2: the gate sees a gap and refuses everything after it. No unrecorded command reaches the robot |
+| the node records a command and never publishes it | 1 | the robot exits 2: the gate sees a gap and refuses everything after it. No unrecorded command reaches the robot. The verifier exits 2 as well (`GATE_REFUSED`, `COMMAND_WITHOUT_RECEIPT`, `GATE_DEADMAN`): the journal says the commands after the gap were not carried out and that the deadman tripped |
 | the node publishes before it writes, and the write fails | 5 | the verifier exits 2 (`GATE_HEAD_NOT_IN_JOURNAL`). One unrecorded command reaches the robot, the same bound as the file demo |
 | the gate skips the signature check | 7 | the scenario driver exits 2: the forged record is accepted and the robot moves at the forger's 1500 mm/s. This is what happened before records were signed |
 | the gate has no deadman | 10 | the scenario driver exits 2: the robot keeps moving at 0.5 m/s for the whole ten seconds the recorder is silent. This is what the gate did before it had one |
-| the gate does not check a command's age | 11 | the scenario driver exits 2: stopped by the deadman at four seconds, the robot starts moving again at six on a command six seconds old. This is what the gate did before it had the check |
+| the gate does not check a command's age | 11 | the scenario driver exits 2: stopped by the deadman at four seconds, the robot starts moving again at six on a command six seconds old. This is what the gate did before it had the check. Its receipt for that command says `applied` |
+| the gate drops the receipt for every refusal | 11, 7 | the robot behaves exactly as it should, and the verifier exits 2. Scenario 11: `COMMAND_WITHOUT_RECEIPT` for the command refused for its age, and `RECEIPT_MISSING` for the skipped number. Scenario 7: `RECEIPT_MISSING` only, since the forged record was never one of the recorder's commands |
+| the gate signs no receipts | 3 | the verifier exits 2: `COMMAND_WITHOUT_RECEIPT` for every command. This is the gate as it was before receipts |
 
 ### When the disk is slow
 
@@ -277,6 +377,10 @@ in the demo):
   carry out a command more than `gate_max_command_age_ms` old (1 second in the demo) and
   keeps the safe state. The record still counts as the next in the chain, so the
   recorder's later commands are accepted as usual.
+- **The journal says the command was not carried out.** The gate's receipt for that
+  record says `refused`, reason `age`, and the verifier reports `GATE_REFUSED`. Its
+  receipt for the deadman trip is there too (`GATE_DEADMAN`). Both were issued during the
+  stall and written when the recorder could write again.
 - **The journal says why.** When the slow write completes, the recorder's next record is
   a `storage_stall` record: which step, which record, and how long, measured on the
   monotonic clock. The verifier then reports `STORAGE_STALL` in place of `HEARTBEAT_GAP`.
@@ -316,19 +420,23 @@ tests only.** A journal in RAM is gone at power-off. `ros2/soak_real_disk.py` ru
 same scenarios on a real disk and reports flush times, stalls and deadman trips as
 measurements, with no pass or fail.
 
-One soak on the same WSL 2 disk, on the code as it is now: ten rounds of scenarios 1 to
-10 and 12, 110 scenario runs in 719 seconds.
-545 journal flushes, median 6.0 ms, the longest 3.30 s. 23 took over one second and none
-went past the 4 second threshold, so no `storage_stall` record was written and the
-verifier reported no stall. The limit on a command's age is 1,000 ms. The gate refused 8
-commands for their age, out of 330 it would otherwise have carried out, and kept the safe
-state each time. Those 8 are why 6 of the 110 scenario runs did not end as the pass/fail
-run expects. The deadman tripped 11 times: ten on purpose in scenario 10, and once more in
-a run where commands were also refused for their age. The longest anchor flush was 2.53 s
-and held nothing up. The clock log's largest step was 0.121 s.
+One soak on the same WSL 2 disk, on the code as it is now, receipts included: ten rounds
+of scenarios 1 to 10 and 12, 110 scenario runs in 782 seconds, 10 October 2026.
+993 journal flushes, median 4.6 ms, the longest 3.33 s. The soak before receipts had 545:
+each command is now two records. 24 took over one second and none went past the 4 second
+threshold, so no `storage_stall` record was written and the verifier reported no stall.
+The limit on a command's age is 1,000 ms. The gate took in 350 command records. It applied
+325, 19 were blocked commands, and it refused 6 for their age and kept the safe state each
+time. Those 6 are why 6 of the 110 scenario runs did not end as the pass/fail run expects.
+The deadman tripped 11 times: ten on purpose in scenario 10, and once in a run of scenario
+1, where the command that followed was then refused for its age. The longest anchor flush
+was 3.75 s and held nothing up. The clock log's largest step was 0.115 s.
 
-A command refused for its age shows in the robot's own log and in its exit code. The
-journal shows that command recorded and forwarded, and the verifier has no finding for it.
+All 6 refusals for age and all 11 deadman trips are in those journals as receipts signed
+by the gate, and the verifier, run over the 110 journals, reported every one: 6
+`GATE_REFUSED` with the reason `age`, 11 `GATE_DEADMAN`. No command record was left
+without a receipt and no receipt number was skipped. In the soak before receipts, 8
+refusals for age and one deadman trip nobody planned left no finding at all.
 
 To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest installed:
 
@@ -336,7 +444,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 119 tests
+python3 -m pytest tests            # with ROS sourced: 143 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
@@ -387,7 +495,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 97 tests without ROS 2 (22 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 119 tests without ROS 2 (24 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
@@ -413,7 +521,7 @@ flag.
 |---|---|---|
 | `docs/SPEC.md` | the specification | |
 | `recorder/` | the recorder, on the `logchain` crate | Rust |
-| `gate/actuator_gate.py` | the actuator-side gate | Python, standard library |
+| `gate/actuator_gate.py` | the actuator-side gate; signs receipts when given a key of its own | Python, standard library |
 | `witness/witness.py` | a witness: stores the roots it is sent and never changes one | Python, standard library |
 | `anchor/anchor_roots.py` | delivers root statements to a witness, or timestamps them (needs openssl) | Python, standard library |
 | `verifier/verify_journal.py` | the verifier | Python, standard library |
@@ -421,7 +529,7 @@ flag.
 | `sources/eu/` | the regulation and its corrigendum as retrieved from the Publications Office of the European Union | |
 | `demo/` | the simulated conveyor and the five scenarios; `pure_ed25519.py` lets the tests play a forger | |
 | `ros2/` | the recorder as a ROS 2 node, a simulated robot with the gate inside it, a launch file, twelve scenarios, the real-disk soak, the clock watchdog | Rust, Python |
-| `tests/` | scenarios, planted bugs, tampering, the gate and its deadman, anchoring, storage stalls, the profile | |
+| `tests/` | scenarios, planted bugs, tampering, the gate, its deadman and its receipts, anchoring, storage stalls, the profile | |
 
 The gate, the witness and the verifier import nothing from each other or from the
 recorder, and tests check their import lists.

@@ -2,7 +2,8 @@
 """A minimal simulated robot with the gate inside it. docs/SPEC.md section 15.
 
     sim_robot.py --state FILE --actuator FILE --safe-state JSON --public-key HEX
-                 [--deadman-seconds N] [--max-command-age-ms N] [--exit-file FILE]
+                 [--deadman-seconds N] [--max-command-age-ms N] [--gate-key FILE]
+                 [--exit-file FILE]
 
 It has one command input, the topic cmd_vel_out, and that input goes straight into the
 gate (gate/actuator_gate.py, the same code the file demo uses). The robot moves only on
@@ -14,6 +15,7 @@ Topics:
   cmd_vel_out    std_msgs/String  in   what the recorder node publishes: records, or a safe-state message
   robot_control  std_msgs/String  in   {"op":"shutdown"}, used by the demo to end a run
   gate_events    std_msgs/String  out  one JSON line per message judged
+  gate_receipts  std_msgs/String  out  the gate's signed receipts, for the recorder to write down
 
 The "robot" is a point with a pose. Twenty times a second it moves by its current
 velocity. Headless, so a run can be judged by exit code.
@@ -29,6 +31,12 @@ Command age: with --max-command-age-ms, a command received by the recorder longe
 that is not carried out when it arrives, and the robot takes the safe state. Its record
 still counts as the next in the chain. The age is the robot's wall clock less the
 recorder's, so on two machines it is only as good as their clocks agree.
+
+Receipts: with --gate-key, the gate signs a receipt for every command record it takes
+into the chain (applied, blocked, or refused for its age), for every message it refuses,
+and for every deadman trip, and the robot publishes it on gate_receipts. The recorder
+node writes each one into the journal. The robot acts first and signs afterwards. The
+key is the gate's own; the robot still holds no key that can sign a record.
 
 Exit codes: 0 the gate refused nothing, 2 it refused at least one message.
 """
@@ -48,7 +56,7 @@ from std_msgs.msg import String
 # SL_GATE_DIR lets a test put a deliberately broken gate in the robot (tests/test_ros2.py).
 sys.path.insert(0, os.environ.get("SL_GATE_DIR") or
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gate"))
-from actuator_gate import Gate  # noqa: E402
+from actuator_gate import Gate, load_gate_key  # noqa: E402
 
 LATCHED = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1000, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -61,7 +69,7 @@ class SimRobot(Node):
     def __init__(self, args):
         super().__init__("sim_robot")
         self.gate = Gate(args.state, json.loads(args.safe_state), args.public_key, args.deadman_seconds,
-                         args.max_command_age_ms)
+                         args.max_command_age_ms, load_gate_key(args.gate_key) if args.gate_key else None)
         self.deadman_trips = 0
         self.actuator_path = args.actuator
         self.velocity = dict.fromkeys(FIELDS, 0)
@@ -69,6 +77,7 @@ class SimRobot(Node):
         self.accepted = self.refused = self.judged = 0
         self.done = False
         self.events = self.create_publisher(String, "gate_events", LATCHED)
+        self.receipts = self.create_publisher(String, "gate_receipts", LATCHED)
         self.create_subscription(String, "cmd_vel_out", self.on_message, LATCHED)
         self.create_subscription(String, "robot_control", self.on_control, 10)
         self.create_timer(STEP, self.move)
@@ -84,14 +93,20 @@ class SimRobot(Node):
             self.refused += 1
         elif decision["n"] is not None:
             self.accepted += 1
-        # Act first, then write things down: a slow disk on the robot's side must not
-        # delay a stop.
+        # Act first, then sign and write things down: neither the signature nor a slow
+        # disk on the robot's side may delay a stop.
         self.act(decision)
+        receipt = self.gate.issue_receipt(decision, wall_ms=int(time.time() * 1000))
         self.gate.save()
         event = {"judged": self.judged, "accepted": decision["accepted"], "n": decision["n"],
                  "why": decision["why"], "reason": decision["reason"], "head": self.gate.state["n"],
                  "message_sha256": hashlib.sha256(msg.data.encode("utf-8")).hexdigest()}
         self.events.publish(String(data=json.dumps(event, sort_keys=True)))
+        self.send_receipt(receipt)
+
+    def send_receipt(self, receipt):
+        if receipt is not None:
+            self.receipts.publish(String(data=json.dumps(receipt, sort_keys=True, separators=(",", ":"))))
 
     def act(self, decision):
         if decision["send"] is not None:
@@ -110,10 +125,13 @@ class SimRobot(Node):
         if tripped:
             self.deadman_trips += 1
             self.act(tripped)
+            receipt = self.gate.issue_receipt(tripped, wall_ms=int(time.time() * 1000))
+            self.gate.save()
             self.events.publish(String(data=json.dumps(
                 {"accepted": None, "n": None, "why": "deadman", "reason": None, "head": self.gate.state["n"],
                  "silent_seconds": tripped["silent_seconds"], "pose": [round(p, 3) for p in self.pose]},
                 sort_keys=True)))
+            self.send_receipt(receipt)
         vx, vy = self.velocity["linear_x_mm_s"] / 1000.0, self.velocity["linear_y_mm_s"] / 1000.0
         heading = self.pose[2]
         self.pose[0] += (vx * math.cos(heading) - vy * math.sin(heading)) * STEP
@@ -129,6 +147,7 @@ def main(argv=None):
     ap.add_argument("--public-key", required=True, help="the recorder's Ed25519 public key, 64 hex characters")
     ap.add_argument("--deadman-seconds", type=int, help="no valid record for this long means the safe state")
     ap.add_argument("--max-command-age-ms", type=int, help="a command older than this is not carried out")
+    ap.add_argument("--gate-key", help="the gate's own signing key file; with it the gate signs receipts")
     ap.add_argument("--exit-file", help="the exit code is also written here, for a launcher")
     args, _ = ap.parse_known_args(argv)
 
