@@ -18,13 +18,20 @@ logchain = { git = "https://github.com/JakPot42/logchain", rev = "b6ae3f3fd6392b
 serde_json = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+# Record signatures (docs/SPEC.md section 7.6).
+ed25519-dalek = "2"
+getrandom = "0.2"
+hex = "0.4"
 
 # Each feature plants one deliberate bug. They exist only so tests/test_planted_bugs.py
 # can show the verifier and the actuator check turn red. Never enable one in a real build.
 [features]
+# Not a bug, a test seam: lets a test make one flush slow (SL_TEST_SLOW_FLUSH). Never enable it in a real build.
+test-slow-flush = []
 planted-bug-clamp-bound = []
 planted-bug-skip-block = []
 planted-bug-stale-in-force = []
 planted-bug-forward-first = []
 planted-bug-forward-and-ignore-failed-write = []
 planted-bug-no-heartbeat = []
+planted-bug-twist-accepts-nonfinite = []

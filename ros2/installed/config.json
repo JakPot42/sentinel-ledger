@@ -1,0 +1,18 @@
+{
+  "machine": "demo-mobile-base-1",
+  "heartbeat_seconds": 2,
+  "measure_every": 5,
+  "recorder_public_key": "",
+  "anchor_every": 4,
+  "gate_deadman_seconds": 4,
+  "gate_max_command_age_ms": 1000,
+  "twist_limits": {"linear_mm_s": 5000, "angular_mrad_s": 10000},
+  "safe_state_action": {
+    "linear_x_mm_s": 0, "linear_y_mm_s": 0, "linear_z_mm_s": 0,
+    "angular_x_mrad_s": 0, "angular_y_mrad_s": 0, "angular_z_mrad_s": 0
+  },
+  "units": {"linear": "millimetres per second", "angular": "milliradians per second"},
+  "software": [
+    {"name": "robot_safety_fw", "version": "1.0.0", "file": "software/robot_safety_fw.bin"}
+  ]
+}

@@ -28,7 +28,7 @@ def anchor_tool(*args):
 # --- the witness ------------------------------------------------------------------------
 
 def ask(port, statement):
-    with socket.create_connection(("127.0.0.1", port), timeout=5) as conn:
+    with socket.create_connection(("127.0.0.1", port), timeout=30) as conn:
         conn.sendall((json.dumps(statement) + "\n").encode("utf-8"))
         return json.loads(conn.makefile("r", encoding="utf-8").readline())
 

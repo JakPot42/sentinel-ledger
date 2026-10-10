@@ -125,6 +125,8 @@ accepted. The recorder sends it every record, of every kind, as
 For each message the gate checks that:
 
 - the hash is `SHA-256(0x00 || record text)`;
+- the record is signed by the recorder (section 7.6). The gate holds the recorder's
+  public key and nothing that could sign;
 - the record's `n` is one more than the last accepted, and its `prev` is the last accepted
   hash. The first record it ever accepts must be a genesis record;
 - a command record's outcome and applied command agree in form.
@@ -141,13 +143,15 @@ The safe-state action is set on the gate's side. The gate does not take it from 
 recorder.
 
 **What this enforces.** No command reaches the actuator unless it arrives inside a record
-that extends the chain the gate has seen. A command with no record, a replayed command, a
-record out of order, a record from a different journal and a record whose text was changed
-are all refused. A recorder that drops, skips or loses a record cannot continue: its next
+that the recorder signed and that extends the chain the gate has seen. A command with no
+record, a replayed command, a record out of order, a record from a different journal, a
+record whose text was changed, and a record built by someone else to follow the chain are
+all refused. A recorder that drops, skips or loses a record cannot continue: its next
 record does not follow the gate's head, so the gate refuses it and everything after it.
 
-**What this cannot enforce.** The gate sees a record. It cannot see whether that record
-reached the disk. A recorder that forwards before it writes, and then fails to write, gets
+**What this cannot enforce.** A signature shows the record was made by someone holding the
+private key. Anyone who can read the recorder's key file can make records the gate
+accepts. And the gate sees a record. It cannot see whether that record reached the disk. A recorder that forwards before it writes, and then fails to write, gets
 that one command through. The gate's head is then a record the journal does not hold. Two
 things follow, and both are tested:
 
@@ -182,6 +186,79 @@ outside the journal's directory, on a different component.
 In this build the gate reads the messages from a file and runs after the recorder, a
 message at a time in scenario 5. Its decisions depend only on the order of the messages,
 so the answers are the ones an in-line gate would give. An in-line gate is not built.
+
+### 4.3 The deadman: silence means the safe state
+
+Record first, then forward, has a consequence. While the recorder cannot record, it
+forwards nothing, and the actuator hears nothing. What the actuator does then must not be
+"whatever it was last told".
+
+So the gate has a deadman. `gate_deadman_seconds` is a setting in the machine's
+configuration, a positive whole number. Once the gate has accepted a record, if no valid
+record follows within that time it sends the safe-state action to the actuator, once, and
+the actuator stays there until the next accepted command.
+
+- **What counts.** Only a record the gate accepts: signed by the recorder and next in the
+  chain. Heartbeat records count. A recorder that is alive and has nothing to say writes
+  a heartbeat every `heartbeat_seconds`, the gate sees it, and the last command stays in
+  force. A refused message does not count, nor does a safe-state message, so another
+  node cannot hold the deadman off.
+- **The value.** It has to be longer than `heartbeat_seconds` or a quiet recorder would
+  trip it. The demo uses 4 seconds with a heartbeat of 2: the same length of silence the
+  verifier calls a gap (section 8).
+- **Where it runs.** On the actuator's side, on that side's clock. It needs nothing from
+  the recorder, which is the point: it is what happens when the recorder says nothing.
+- **Before the first record** the gate has passed nothing on, and the deadman does not
+  run.
+- **What it is not.** It does not judge a command's age. That is section 4.4.
+
+The setting is in the genesis record's `settings` when the machine has one, and the
+configuration file is hashed into the state in force, so every record names it.
+
+The file demo's gate reads a file after the recorder has finished. It has no clock to run
+a deadman against and does not run one. The simulated robot of section 15 does. The
+planted bug for this is a gate with the deadman removed: the robot runs on for the whole
+of the recorder's silence.
+
+### 4.4 A command's age
+
+The deadman covers silence. It does not cover what comes after: a command whose record
+was held up, by a slow disk for example, and reaches the gate seconds late. It is a valid
+record and it follows the chain. Carried out, it moves the machine on an instruction
+that was right some seconds ago.
+
+So every command record carries `received_ms`: the time the recorder received the
+command, in milliseconds since 1970 on the recorder's clock, taken before the recorder
+waits for anything. And the gate has a limit, `gate_max_command_age_ms`, a positive whole
+number in the machine's configuration.
+
+When a command record arrives, the gate takes its own wall clock and subtracts
+`received_ms`:
+
+- more than the limit: the command is not carried out. The safe-state action goes to the
+  actuator;
+- more than the limit in the other direction, a command dated ahead of the gate's clock:
+  the same. The two clocks disagree by more than the limit and the gate does not guess;
+- no `received_ms` in a command record: the same.
+
+**The record is still taken into the chain.** It is a genuine, signed record and the
+recorder's later records name it as their predecessor. If the gate dropped it, it would
+refuse everything after it. Only the action is refused. The gate reports it as a refusal
+and the simulated robot exits 2.
+
+Only command records have an age. A heartbeat or any other record is never stale.
+
+**The limit of this check.** It compares two clocks. On one machine the recorder and the
+gate read the same clock and the check is sound. On separate machines it is only as good
+as the two clocks agree: a gate whose clock runs behind lets old commands through, and
+one that runs ahead refuses fresh ones. Synchronized clocks are needed, and nothing in
+this build provides or tests that. Two more: the age starts when the recorder's own code
+first sees the command, so time the command spent before that (in a queue, on the
+network) is not counted; and a wall clock can be stepped. A real controller would also
+want the command's time of origin from the controller itself.
+
+The planted bug for this is a gate with the age check removed: in scenario 11 the robot,
+stopped by the deadman, starts moving again on a command six seconds old.
 
 ## 5. Core rule 2: requested and applied, and which rule acted
 
@@ -250,8 +327,8 @@ At any point in the journal, three things are in force:
 The first record in a journal is a `genesis` record that states all three. After that, they
 change only through intervention records.
 
-The genesis record also carries `settings`: `heartbeat_seconds`, `measure_every` and
-`safe_state_action`, copied from the configuration file. An intervention that changes the
+The genesis record also carries `settings`: `heartbeat_seconds`, `measure_every`,
+`safe_state_action` and `recorder_public_key`, copied from the configuration file. An intervention that changes the
 configuration carries the new `settings`. This is how the verifier knows the heartbeat
 interval without being handed the configuration file.
 
@@ -324,10 +401,11 @@ common to every record:
   "schema": "sentinel-ledger/record/0"
   "kind":   "genesis" | "recorder_start" | "recorder_stop" | "command"
             | "intervention_declared" | "intervention_detected" | "heartbeat"
-            | "recorder_fault"
+            | "recorder_fault" | "storage_stall" | "anchor_failed"
   "n":      position in the journal, from 0
   "prev":   hex leaf hash of record n-1, or "" for n = 0
   "at":     recorder clock, UTC, whole seconds, exactly YYYY-MM-DDTHH:MM:SSZ
+  "sig":    Ed25519 signature over every other field, 128 hex characters (section 7.6)
 
 genesis:
   "machine", "state" (section 6.1), "settings"
@@ -335,8 +413,9 @@ genesis:
 command:
   "requested", "applied" (null when blocked), "outcome", "rules_acted",
   "reported" (an object with the same three fields: "applied", "outcome",
-  "rules_acted"), "safety_inputs", "in_force", and optionally "decision_sha256",
-  "decision_bytes"
+  "rules_acted"), "safety_inputs", "in_force", "received_ms" (when the recorder
+  received the command, whole milliseconds since 1970 on its clock; section 4.4),
+  and optionally "decision_sha256", "decision_bytes"
 
 intervention_declared:
   "target" ("ruleset", "config" or "software:<name>"), "old", "new", "operator",
@@ -359,7 +438,50 @@ heartbeat:
 
 recorder_fault:
   "step", "detail". Written, when possible, on entering the safe state.
+
+storage_stall:
+  "step" (the longest write in the interval: "journal_write", "decision_file",
+  "install" or "anchor_write"), "of_record" (the number of the record that write
+  belonged to), "stalled_ms" (the time the recorder spent waiting for storage since the
+  record before, in whole milliseconds, measured on the monotonic clock).
+
+anchor_failed:
+  "entry_count" (the number of records the lost anchor statement covered), "detail".
+  Written when an anchor statement could not be written (section 7.5).
 ```
+
+**Storage stalls.** A record's `at` is taken when the record is built, before it is
+written. If the write then takes eight seconds, the next record's `at` is eight seconds
+later, and a reader sees a gap. The recorder knows why, and says so.
+
+The rule is the verifier's own. The verifier calls it a gap when two consecutive records'
+`at` values, which are whole seconds, differ by more than `2 * heartbeat_seconds`
+(section 8). The recorder applies exactly that comparison, on the same clock and at the
+same resolution, to the last record's time and the present, at two moments: as soon as a
+record has been written and forwarded, and before it builds any record. If it is a gap by
+that test, and the time the recorder spent waiting for storage since the last record
+accounts for it by the verifier's own rule (the gap, less the storage time, is no more
+than `2 * heartbeat_seconds`), the next record is a `storage_stall` record.
+
+Because the recorder uses the verifier's test and not a stopwatch of its own, the two
+cannot disagree about whether there is a gap. A write of 1.9 seconds that happens to
+straddle three whole seconds is a gap to the verifier, and the recorder states it. A
+write of 2.5 seconds that lands two whole seconds later is not a gap to the verifier, and
+the recorder writes nothing, because there is nothing to explain. Both are tests.
+
+- The time stated is measured on the monotonic clock, which a correction to the wall
+  clock does not move. The decision to state it uses the wall clock in whole seconds,
+  because that is what the records carry.
+- A silence that storage does not account for gets no stall record. The recorder does not
+  dress a hang up as a stall.
+- Writing a stall record can itself be slow and leave another gap. At most three are
+  written in one go.
+- A stall in writing the `recorder_stop` record is not stated, because nothing is written
+  after a stop.
+- It is the recorder's statement. It is signed, so it cannot be added by someone without
+  the key. The verifier cannot confirm that storage was the cause, only that the recorder
+  said so and that the stated time accounts for the gap (section 8).
+- The gate treats it as any other record.
 
 The data directory holds `logchain.journal` and `logchain.state` (LogChain's names),
 `rulesets/<sha256>.json` (every ruleset that was ever in force, by the hash of its bytes),
@@ -402,6 +524,25 @@ in canonical form:
 The recorder does nothing else. It makes no network call, so a slow or absent witness
 cannot hold up a command. A separate program, `anchor/anchor_roots.py`, delivers the
 statements.
+
+A statement is written under a temporary name, flushed, and renamed into place, so a
+reader never finds half a statement under a statement's name.
+
+**Off the lock.** The command-line recorder writes each statement itself before it
+carries on. The ROS node does not: it hands the statement to a thread that writes it, and
+the recorder goes on to the next record at once (section 15.4). A statement is evidence
+about records already on disk, so no record waits for it. Two consequences, both tested:
+
+- a statement can land a little after the records it covers, and if the disk fails it may
+  not land at all. That is not a fault and does not stop the machine. The recorder writes
+  a signed `anchor_failed` record naming the statement that was lost, and the verifier
+  reports it (`ANCHOR_FAILED`). A line on a status topic would be gone with the process;
+  the journal is where the recorder says what happened to it. The command-line recorder
+  does the same. The one exception is the last statement, written after the stop record:
+  nothing is written after a stop, so its loss is not stated;
+- nothing about verification changes. An anchor is only ever compared with a root
+  recomputed from the journal. One that is late or missing removes a check, or is itself a
+  finding (`NO_ANCHOR_FOR_JOURNAL`). It cannot make a check pass.
 
 **A witness.** `witness/witness.py` is a separate process. It stores the statements it is
 sent, with the time it received each, and never changes or removes one. It refuses a
@@ -449,12 +590,53 @@ between successive roots. Until they are, a witness must keep every root and the
 must check every one. A witness run only by whoever supplies the recorder would make that
 supplier the one party everyone has to trust, which is what anchoring is meant to avoid.
 
+### 7.6 Signatures
+
+Every record is signed with Ed25519 (RFC 8032).
+
+- **What is signed.** The canonical form (section 7.1) of the record with every field
+  except `sig`. The signature, as 128 lowercase hexadecimal characters, is then put into
+  the record as `sig`. The leaf hash is taken over the record with `sig` in it, so the
+  next record's `prev`, and the root, cover the signature as well.
+- **The private key** is a file holding the 32-byte seed of RFC 8032 as 64 hexadecimal
+  characters. It is kept outside the journal's directory. On Unix the recorder refuses to
+  start if anyone but the file's owner can read it. `sentinel-recorder keygen --out FILE`
+  makes one and prints the public key.
+- **The public key** is `recorder_public_key` in the configuration file. The configuration
+  file's hash is part of the state in force, so every record names, through `in_force`,
+  the configuration that held the key it was signed for. The key is also copied into the
+  first record's `settings`.
+- **The recorder** refuses to start unless the key file is the private half of the
+  configured public key.
+- **The gate** is given the public key when it is started, from its own copy of the
+  configuration. It refuses any record whose signature does not verify.
+- **The verifier** checks every record's signature against the key the first record
+  names. Given `--public-key`, it also requires that key to be the one supplied, which is
+  how a journal re-signed throughout with someone else's key is caught.
+
+What a signature does and does not add:
+
+- A node or a person without the key cannot make a record the gate accepts, and cannot
+  rewrite a journal without the verifier seeing it, even when the verifier is given
+  nothing from outside the journal's directory.
+- **Anyone who can read the private key file can forge.** That includes the operator, and
+  anything running as the recorder's user. Signatures do not make the journal evidence
+  against the operator. Anchoring (section 7.5) and the gate's head are what do that.
+- **Key rotation is not supported.** A configuration that names a different key is refused.
+  A lost or exposed key means a new journal.
+- **The key is a file.** Keeping it in hardware (a TPM, a secure element, an HSM) so that
+  it cannot be copied is out of scope.
+- The recorder signs with the `ed25519-dalek` library. The gate and the verifier each
+  carry their own verification code in plain Python, checked against the RFC's test
+  vectors. It takes about 4 ms a signature, so a long journal verifies slowly.
+
 ## 8. The verifier
 
 ```
 python verifier/verify_journal.py JOURNAL --rulesets DIR [--root HEX]
                                   [--witness-store FILE] [--anchors DIR] [--gate-state FILE]
-                                  [--decisions DIR] [--profile FILE --as-of YYYY-MM-DD] [--json]
+                                  [--public-key HEX] [--decisions DIR]
+                                  [--profile FILE --as-of YYYY-MM-DD] [--json]
 python verifier/verify_journal.py --receipt FILE --root HEX
 ```
 
@@ -490,8 +672,19 @@ against the witness's anchors alone.
 | `RULESET_UNAVAILABLE` | the ruleset in force is not in `--rulesets`, or its bytes do not hash to `ruleset_sha256` |
 | `RULE_MISMATCH` | declared ruleset: recomputed `applied`, `outcome` or `rules_acted` differs from the record |
 | `REPORTED_MISMATCH` | declared ruleset: `reported` differs from the recomputed result. Opaque ruleset: the record's own outcome differs from `reported` |
-| `HEARTBEAT_GAP` | more than `2 * heartbeat_seconds` between consecutive records, unless the first is a `recorder_stop` and the second a `recorder_start` |
+| `HEARTBEAT_GAP` | more than `2 * heartbeat_seconds` between consecutive records, unless the first is a `recorder_stop` and the second a `recorder_start`, or the second is a `storage_stall` record that accounts for it (next row) |
+| `STORAGE_STALL` | a `storage_stall` record: the recorder states how long it waited for storage. Reported for every such record. The gap ending at that record is not also reported as `HEARTBEAT_GAP` if the stated time accounts for it: the gap less `stalled_ms` is no more than `2 * heartbeat_seconds` |
+| `ANCHOR_FAILED` | an `anchor_failed` record: the recorder states that an anchor statement could not be written. The records it would have covered have one piece of outside evidence fewer |
+| `SIGNATURE_MISSING` | a record has no `sig` |
+| `SIGNATURE_INVALID` | a record's `sig` is not a valid signature of its other fields under the key the first record names |
+| `KEY_MISMATCH` | `--public-key` was given and the first record names a different key |
 | `DECISION_MISMATCH` | a decision file is present and does not hash to `decision_sha256`, or is not `decision_bytes` long |
+
+`STORAGE_STALL` is a finding and the exit code is 2. The recorder could not record for
+that time, and the report says so. The threshold for a gap is the same with or without a
+stall record; a stated stall too short to account for the silence leaves the
+`HEARTBEAT_GAP` in place beside it. A `storage_stall` record without usable numbers is
+`RECORD_MALFORMED` and explains nothing.
 
 A receipt is checked for `RECEIPT_LEAF_MISMATCH` (the record is not the leaf the proof is
 about) and `RECEIPT_ROOT_MISMATCH` (the proof does not lead to the supplied root).
@@ -516,6 +709,8 @@ as asof-gate does, so the same inputs always give the same output.
   same for every record an anchor covers, **if** the keeper cannot reach the witness.
 - With the gate's state, that the last record the actuator's side accepted is in the
   journal.
+- That every record was signed by a holder of the recorder's private key. With
+  `--public-key`, that the key is the machine's.
 - Each command names the state the journal's own interventions put in force.
 - Under a declared ruleset, the recorded outcome is what that ruleset gives for the
   recorded request and the recorded safety inputs.
@@ -739,9 +934,10 @@ verifier MUST NOT print "compliant", "conforms" or "meets the regulation".
   afterwards. It says nothing about whether the safety inputs were accurate, whether the
   decision data left something out, or whether a journal was simply never produced. This is
   the limit set out in LogChain's `docs/LIMITS.md`, and nothing here gets round it.
-- **Not signed.** A root commits to content. It does not say who wrote the journal. A
-  timestamp token, when one is fetched, says a root existed by a certain time and nothing
-  more.
+- **Signed, which proves less than it sounds.** Each record carries a signature made with
+  the recorder's private key. That shows a holder of the key made it. The operator holds
+  the key. A timestamp token, when one is fetched, says a root existed by a certain time
+  and nothing more.
 - **Not a verdict.** It records declared and detected changes. It never says a change was
   improper or who was at fault.
 
@@ -780,6 +976,13 @@ carries a chained record. It cannot enforce that the record was written. And the
 one unrecorded command, stated in an earlier draft as a property of the gate, is a
 property of this recorder. Section 4.2 states both in the form the build supports.
 
+Third round, the same day, after the ROS 2 version showed that a forged, correctly
+chained record was accepted:
+
+9. Records are signed with Ed25519. The gate holds the public key only and refuses a
+   record whose signature does not verify. The verifier checks signatures. Section 7.6.
+10. Not built, by decision: key rotation, hardware key storage, SROS 2.
+
 ## 13. Not verified
 
 - Whether Regulation (EU) 2023/1230 has been amended since the corrigendum of 4 July 2023
@@ -793,17 +996,21 @@ property of this recorder. Section 4.2 states both in the form the build support
   operating system to flush the journal after every record and treats a failure as a
   failed write. On some storage a flush that reports success has not reached the medium.
   No power-loss test has been run.
-- The recorder has only been run on Windows.
+- The file demo runs on Windows 11 and on Ubuntu 26.04 under WSL 2. The ROS 2 part has
+  run only on Ubuntu 26.04 under WSL 2, with ROS 2 Lyrical and rclrs 0.8. No real robot,
+  no second machine, no other ROS distribution.
 
 ## 14. Limits of this build
 
-- **No live clock-driven heartbeat.** Heartbeats are written when the demo driver advances
-  a fixed clock. With the system clock the recorder has no timer, so a quiet period would
-  show as a gap. A real deployment needs one.
-- **No transport.** Commands arrive as lines on standard input and the actuator is a file.
+- **The command-line recorder has no clock-driven heartbeat and no transport.** Its
+  heartbeats are written when the demo driver advances a fixed clock, and its commands
+  arrive on standard input. The ROS 2 node (section 15) has both: a timer and topics.
 - **No journal rotation.** The journal grows without bound, and LogChain's append rereads
   the whole journal to recompute the root, so each record costs more than the last.
-- **Anchoring is a first form.** One witness, unsigned, on localhost in the demo. No
+- **The private key is a file.** Anyone who can read it can forge records. No rotation,
+  no hardware storage. On Windows the recorder does not check who can read the file.
+- **Anchoring is a first form.** One witness, which does not sign what it stores, on
+  localhost in the demo. No
   consistency proofs, no cosigning, no second witness. FreeTSA has not been called by any
   test or by this build: the timestamp path was exercised with a throwaway authority made
   by openssl. A real token from FreeTSA has not been fetched or verified here.
@@ -820,9 +1027,298 @@ property of this recorder. Section 4.2 states both in the form the build support
   direction of section 4. LogChain's state file is then one entry behind and must be
   rebuilt before the recorder is restarted. Nothing rebuilds it yet.
 - **A refused command leaves no trace** (section 5.1).
+- **A slow disk stops the recorder for as long as it is slow.** Measured: up to 7.8
+  seconds for one flush on WSL 2 (section 15.8). The deadman stops the actuator and the
+  journal states the stall, but for that time nothing is recorded and nothing is forwarded.
+- **The check on a command's age compares the recorder's clock with the gate's.** Across
+  separate machines it needs synchronized clocks, which are not built (section 4.4).
+- **The deadman exists only where the gate has a clock.** The simulated robot has one.
+  The file demo's gate does not.
 - **Measurement is periodic.** A file changed and changed back between two measurements is
   not seen.
 - **The reference safety layer lives inside the recorder.** In the demo the recorder
   evaluates the declared ruleset itself, so `reported` and the recorded outcome always
   agree unless a bug is planted. A real safety layer is a separate component, and
   `REPORTED_MISMATCH` only earns its place then.
+
+## 15. The recorder as a ROS 2 node
+
+Built and run on ROS 2 Lyrical, Ubuntu 26.04, with the Rust client library rclrs 0.8.
+Everything above this section applies unchanged. This section says what is added and
+where the ROS version falls short.
+
+### 15.1 Two processes
+
+```
+controller --Twist--> cmd_vel_in --> [ recorder node ] --records--> cmd_vel_out --> [ gate, inside the robot ] --> motion
+sensor --JSON--> safety_inputs ----^
+```
+
+- **The recorder node** (`ros2/sentinel_recorder_node`, Rust) is the recorder of sections
+  4 to 7 with topics for its input and output.
+- **The simulated robot** (`ros2/sim_robot.py`) is a separate process with the gate of
+  section 4.2 inside it. It is a point that moves by its current velocity twenty times a
+  second. It has no display.
+
+`ros2/launch/sentinel.launch.py` starts both.
+
+| topic | type | direction | what |
+|---|---|---|---|
+| `cmd_vel_in` | `geometry_msgs/Twist` | into the recorder | the requested command |
+| `safety_inputs` | `std_msgs/String` | into the recorder | a JSON object of integers, for example `{"light_curtain_clear":1}` |
+| `recorder_control` | `std_msgs/String` | into the recorder | JSON: a declared intervention, a measurement, or a stop |
+| `cmd_vel_out` | `std_msgs/String` | recorder to robot | the message of section 4.2: the record's text, its number, its hash |
+| `recorder_status` | `std_msgs/String` | out of the recorder | one JSON reply for each input handled |
+| `gate_events` | `std_msgs/String` | out of the robot | one JSON line for each message the gate judged |
+
+`cmd_vel_out` is reliable and transient local with a history of 1000, so a robot that
+starts after the recorder still receives the chain from its first record.
+
+The recorder node creates no publisher of `Twist`. The robot subscribes to no `Twist`. The
+only thing that sets the robot's velocity is an action the gate hands it.
+
+### 15.2 From a Twist to a command
+
+A Twist is six floating-point numbers. Section 5.1 allows integers only. The node converts
+once, on arrival, and the record holds the result:
+
+| Twist field | command field | unit |
+|---|---|---|
+| `linear.x`, `linear.y`, `linear.z` | `linear_x_mm_s`, `linear_y_mm_s`, `linear_z_mm_s` | whole millimetres per second |
+| `angular.x`, `angular.y`, `angular.z` | `angular_x_mrad_s`, `angular_y_mrad_s`, `angular_z_mrad_s` | whole milliradians per second |
+
+- The value is multiplied by 1000 and rounded to the nearest integer, halves away from zero.
+- All six fields are always present in the command, including those that are zero.
+- A Twist with NaN or infinity in any field is refused.
+- A Twist with any field whose magnitude, after conversion, is above the limit is refused.
+  The limits are `twist_limits` in the configuration file: `linear_mm_s` and
+  `angular_mrad_s`. The configuration file is hashed into the state in force, so every
+  record names the limits that applied.
+- A refused Twist leaves no record and nothing is sent to the robot, as in section 5.1.
+
+The limit is a sanity bound on the input. It is separate from the safety rules, which clamp
+or block a command that was accepted.
+
+A clamped command's record holds both values, as section 5 requires: `requested` is the
+converted request (1800 for 1.8 m/s) and `applied` is what the rules left of it (1500),
+with the rule's id in `rules_acted`. A test reads the record back to check. What the
+record does not hold is the original floating-point number: only its rounded integer.
+
+### 15.3 Safety inputs
+
+The node keeps the last `safety_inputs` message it received and uses it for every command.
+Before the first one arrives there are no inputs, and a `block_when` rule with a missing
+input fires (section 5.2), so the robot does not move until a safety signal has been seen.
+A message that is not a JSON object of integers clears the inputs.
+
+### 15.4 Heartbeat, and publishing off the recorder's lock
+
+A thread of its own checks five times a second whether `heartbeat_seconds` have passed
+since the last record and writes a heartbeat if so. It does not depend on the ROS
+executor.
+
+Publishing is done by another thread that takes messages from a queue, in order. The
+recorder, while it holds its lock, only puts a line on the queue. A record is therefore
+written to the journal first and published a moment later, which is the order section 4
+requires, and a slow publish cannot hold up the next record. The cost: a publish that
+fails is no longer reported back to the recorder as a fault.
+
+Getting here took four attempts, each caught by running the scenarios repeatedly and each
+leaving the journal without a heartbeat for five to twelve seconds, against a tolerance of
+four in the demo:
+
+1. a check between calls to `spin` with a timeout: the call did not return until a message
+   arrived;
+2. a ROS timer: the same, about once in fifty runs;
+3. a separate thread that published while holding the recorder's lock;
+4. a separate thread and a publishing queue, with the main loop still taking the
+   recorder's lock on every pass to read a stop flag. When `spin` returned at once the
+   loop took the lock over and over and the heartbeat thread waited behind it.
+
+Two things were checked along the way, by measurement: the wall clock in WSL did not
+step, and flushing a file to disk took 10 ms at worst. The second was wrong as a general
+statement. It was true of the runs measured that day. Section 15.8 is what a longer look
+found, and it accounts for a stall the four fixes above did not.
+
+**Anchor statements** are also written by a thread of their own (section 7.5). Under the
+recorder's lock, one anchor flush of 7.8 seconds kept every other record waiting. A
+statement that cannot be written does not put the recorder in the safe state. The
+failure goes back to the recorder, which states it in an `anchor_failed` record within
+a fifth of a second, and it is also reported on `recorder_status`. Scenario 12.
+
+**For diagnosis**, off unless asked for: with `SL_TRACE_FILE` set, the node appends one
+line for each write (how long it took), each heartbeat, and each wait for the lock, with
+the monotonic clock beside the wall clock. `ros2/clock_watchdog.py` is a separate program
+that logs three clocks every 100 ms and shares nothing with the recorder. Laid side by
+side, the two say whether a silence was the recorder or the whole machine.
+
+### 15.5 What the gate refuses on `cmd_vel_out`
+
+Any node can publish on any topic. ROS 2 has no access control unless SROS 2 is set up.
+The scenarios play a second node publishing straight onto the robot's input:
+
+| what the other node publishes | gate | refused because | test |
+|---|---|---|---|
+| a command with no record | refused | no record | scenario 6 |
+| text that is not JSON | refused | no record | scenario 6 |
+| a real record the recorder sent earlier, sent again | refused | signed, but it does not extend the chain | scenario 6 |
+| a real record with its text changed and its hash left alone | refused | the hash | scenario 6 |
+| a well-formed record two ahead of the gate's head | refused | not signed by the recorder | scenario 6 |
+| a correctly hashed record that follows the gate's head, carrying a signature lifted from a real record | refused | not signed by the recorder | scenario 7 |
+| the same, properly signed with a key of the forger's own | refused | not signed by the recorder | scenario 8 |
+| the same, with no signature | refused | not signed by the recorder | scenario 9 |
+
+In scenarios 7 to 9 the robot never moves at the forger's speed, the recorder's own next
+command is accepted, and the journal verifies.
+
+Before records were signed, the forged record of scenario 7 was accepted and moved the
+robot at 1500 mm/s. A test keeps that visible: it hands the robot a copy of the gate with
+the signature check removed, and scenario 7 turns red in exactly that way.
+
+What is left: a node that can read the recorder's private key file can still forge
+(section 7.6). And every refusal sends the safe state, so a node that publishes junk on
+`cmd_vel_out` cannot move the robot, but it can stop it, as often as it likes.
+
+### 15.6 Gaps, and the bound
+
+A gap is a record number the gate did not see. What can pass in each case:
+
+| how the gap arises | unrecorded commands that reach the robot | then |
+|---|---|---|
+| the node records a command and never publishes it (planted bug) | none | the gate refuses every later record; the robot gets only the safe state; the journal is whole |
+| a message is lost in transit | none | the same |
+| the node publishes before it writes, and the write fails (planted bug) | one, with this recorder | `GATE_HEAD_NOT_IN_JOURNAL`; on restart the gate refuses the recorder |
+| a recorder that ignores failed writes (section 4.2) | any number, until the gate's head is compared with the journal | the same finding |
+| another node forges the next record without the recorder's key (15.5) | none | the gate refuses it; the recorder carries on |
+| someone who can read the recorder's key file forges records | any number, until compared | `GATE_HEAD_NOT_IN_JOURNAL` |
+
+This is the bound of section 4.2, unchanged by ROS: the gate cannot see whether a record
+reached the disk.
+
+A recorder that says nothing at all is a different case from a gap in the numbers. The
+gate sees no record to refuse. That is the deadman's case (section 4.3): scenario 10
+freezes the recorder's process for ten seconds with the robot at 0.5 m/s, and the robot
+is stopped after four.
+
+### 15.7 What the ROS version does not cover
+
+- **A robot with a plain `Twist` input.** If the robot, or its driver, also listens on a
+  `Twist` topic, any node can move it and nothing here can refuse that. The demo robot has
+  no such input. A real one would need SROS 2 access control, which is not set up or
+  tested here.
+- **Whoever can read the private key file.** They can forge records the robot accepts.
+  Key rotation and hardware key storage are out of scope (section 7.6).
+- **Stale safety inputs.** The last safety message stays in force however old it is. A
+  sensor that stops publishing "clear" is not noticed.
+- **Who publishes `safety_inputs` and `recorder_control`.** Any node can. A false "clear",
+  or a declared intervention from an unknown node, is recorded as it arrived.
+- **A robot that joins more than 1000 records late** does not receive the start of the
+  chain and refuses everything.
+- **Decision data, anchoring to a witness and timestamps** are not wired into the ROS
+  scenarios. The node writes anchor statements as before; nothing delivers them.
+- **Precision.** Speeds are whole millimetres and milliradians per second. Anything finer
+  in the incoming Twist is rounded away before it is recorded.
+- **A custom message type** for `cmd_vel_out` in place of JSON in a string: not built.
+- **An in-line gate in a real controller, real time behaviour, more than one machine, a
+  real robot, a simulator with physics:** none tested.
+- **After a fault, the time the recorder was down shows as `HEARTBEAT_GAP`.** Scenario 5
+  expects exit 2 from the verifier after the restart for that reason. It is what happened.
+- **The simulated robot's deadman shares a thread with everything else the robot does.**
+  A slow write of the gate's own state file delays the check. The robot now acts on a
+  decision before writing anything down, so a stop is not delayed by its own disk, but a
+  real controller needs the deadman on a timer of its own.
+- **The command's age is measured between two clocks on one machine here.** The recorder
+  node and the robot run on the same computer in every test (section 4.4).
+- **The age starts at the node's callback.** A Twist has no time stamp of its own. Time a
+  message spent queued before the node's code ran is not counted.
+
+### 15.8 When the disk is slow
+
+Section 4 makes every command wait for the disk. This section is what that costs on a
+disk that is sometimes slow, what was measured, and what the build now does about it.
+
+**What was measured.** WSL 2, Ubuntu 26.04, ext4 on a virtual disk file on an NVMe SSD,
+9 October 2026. Three instruments: the node's own trace, an independent clock log
+(`ros2/clock_watchdog.py`), and a program that only writes and flushes a small file.
+
+| | measured |
+|---|---|
+| a journal flush, usual | about 10 ms (median) |
+| a journal flush, worst seen | 4.0 s |
+| an anchor file flush, worst seen | 7.8 s |
+| longest time with no record written | 8.2 s, against a threshold of 4 s |
+| the independent clock log over the same runs | no step over 0.105 s on the wall, monotonic or boot-time clock |
+| the flush-only program, recorder not running, idle machine | bursts of about 15 s in which every flush took 0.5 to 2.0 s |
+| runs of the nine scenarios that failed on that disk for this reason | 3 of 12 |
+
+The machine did not pause: a paused machine would have paused the clock log too. The
+heartbeat thread woke on time on every pass. The time went inside the calls that flush a
+file to disk, made while the recorder held its lock. Why that disk has slow bursts is not
+known. A guess that they follow a large build was tested and not supported.
+
+**What a reader of the journal saw.** A `HEARTBEAT_GAP`. That was true: for those seconds
+the recorder could not record. It did not say why, and it read the same as a recorder
+that had hung.
+
+**What the robot did.** Nothing different. It had no deadman. In the measured case its
+last command happened to be a stop. Had it been a speed, the robot would have held that
+speed for the whole of the silence.
+
+**What happens now.**
+
+1. The gate's deadman stops the robot when no valid record has arrived for
+   `gate_deadman_seconds` (section 4.3). Scenario 10.
+2. The command that was held up is not carried out when it finally arrives. The gate
+   refuses a command older than `gate_max_command_age_ms` (section 4.4), 1000 in the
+   demo, and the robot stays in the safe state. Scenario 11.
+3. When the slow write completes, the recorder writes a `storage_stall` record with the
+   measured duration (section 7.2), and the verifier reports `STORAGE_STALL` in place of
+   an unexplained gap (section 8). It is still a finding. Scenario 11, on a test build
+   whose flush can be made slow on demand, since a real disk cannot be told to stall.
+4. Anchor statements are flushed off the lock (sections 7.5 and 15.4), which removes the
+   longest wait measured. One that cannot be written is stated in the journal. Scenario 12.
+
+None of this makes the recorder faster. On a disk that takes eight seconds, a command
+waits eight seconds, and is then refused for its age. What changes is that the robot is
+stopped, stays stopped until a fresh command, and the journal says what happened.
+
+**Scenario 11, step by step.** The robot is moving at 0.5 m/s. The next command's record
+takes six seconds to land. At four seconds the deadman stops the robot. At six the record
+is forwarded: the gate takes it into the chain, sees a command six seconds old against a
+limit of one, and keeps the safe state. The recorder's next record states the stall. A
+fresh command after that moves the robot as usual. Before the age check existed the
+robot started moving again at six seconds on the old command; the planted bug keeps that
+visible.
+
+**Tests, and where the journal is kept for them.** The scenarios are judged pass or fail
+and several depend on timing. On the disk above a round of them often has a run that
+ends differently (6 rounds of 10 in the soak below), for a reason that is true and is not
+about the code. So the pass/fail runs put the scenario
+folders, journal included, in a RAM-backed folder (`/dev/shm`). This is for tests only: a
+journal in RAM does not survive power-off, and a flush there proves nothing about a disk.
+
+`ros2/soak_real_disk.py` is the other half. It runs the same scenarios on a real disk for
+a number of rounds and reports flush times, stall records, deadman trips and verifier
+findings as measurements. It has no pass or fail and exits 0 whenever it could run.
+
+One soak, on the disk above, on the code as it is now: ten rounds of scenarios 1 to 10
+and 12, 110 scenario runs in 719 seconds. `gate_max_command_age_ms` was 1,000.
+
+| | measured |
+|---|---|
+| journal flushes | 545: median 6.0 ms, longest 3.30 s, 32 over 0.5 s, 23 over 1 s, 0 over 4 s |
+| anchor flushes, off the lock | 257: median 3.4 ms, longest 2.53 s, 15 over 0.5 s |
+| `storage_stall` records written | 0: no flush left a gap past the threshold |
+| commands the gate refused for their age | 8, out of 330 it would otherwise have carried out |
+| deadman trips | 11: one in each round from scenario 10, and one more in a run where commands were also refused for their age |
+| verifier findings beyond those the scenarios cause on purpose | none |
+| scenario runs not as the pass/fail run expects | 6 of 110, each because a command was refused for its age |
+| the clock log | 7,193 lines, largest step 0.121 s |
+
+Ten rounds on one disk on one day. No flush went past the heartbeat threshold in this run,
+so it did not put the stall record to work on a real disk; scenario 11 does that with the
+test build. What it shows is the limit on a command's age at work: a flush of one to three
+seconds is too short to be a stall and long enough to make a command late, and the gate
+refused those commands and kept the safe state. A refusal for age is in the robot's own
+log and exit code. The journal shows the command recorded and forwarded, and the verifier
+has no finding for it. This is not a measure of how often that disk stalls.

@@ -1,4 +1,6 @@
-recorder/target/
+recorder/target*/
 demo/out/
 __pycache__/
 .pytest_cache/
+ros2/out/
+ros2/sentinel_recorder_node/target*/

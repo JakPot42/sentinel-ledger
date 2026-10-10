@@ -97,6 +97,19 @@ pub struct Config {
     pub measure_every: i64,
     /// Write an anchor statement every this many records. 0 or absent: never.
     pub anchor_every: i64,
+    /// Largest magnitude accepted when a ROS Twist is converted to integers:
+    /// (linear, in mm/s; angular, in mrad/s). Absent when the machine takes no Twist.
+    pub twist_limits: Option<(i64, i64)>,
+    /// The Ed25519 public key records must be signed with, 64 hexadecimal characters.
+    pub recorder_public_key: String,
+    /// The actuator-side gate's deadman: with no valid record for this many seconds, the
+    /// gate sends the safe state. Absent: the gate has no deadman (the file demo, where
+    /// the gate reads a file after the fact and has no clock to run one against).
+    pub gate_deadman_seconds: Option<i64>,
+    /// The gate's limit on a command's age: a command received by the recorder more than
+    /// this many milliseconds before it reaches the gate is not carried out. Absent: no
+    /// limit (the file demo, whose gate has no clock).
+    pub gate_max_command_age_ms: Option<i64>,
     pub safe_state_action: Value,
     pub software: Vec<SoftwareEntry>,
 }
@@ -127,7 +140,32 @@ impl Config {
             machine: text(&v, "machine")?,
             heartbeat_seconds: whole("heartbeat_seconds")?,
             measure_every: whole("measure_every")?,
+            recorder_public_key: match v.get("recorder_public_key").and_then(Value::as_str) {
+                Some(k) if k.len() == 64 && k.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) => k.to_string(),
+                _ => return Err("config needs recorder_public_key: 64 lowercase hexadecimal characters".to_string()),
+            },
             anchor_every: v.get("anchor_every").and_then(Value::as_i64).unwrap_or(0),
+            gate_deadman_seconds: match v.get("gate_deadman_seconds") {
+                None => None,
+                Some(d) => match d.as_i64() {
+                    Some(i) if i > 0 => Some(i),
+                    _ => return Err("gate_deadman_seconds must be a positive integer".to_string()),
+                },
+            },
+            gate_max_command_age_ms: match v.get("gate_max_command_age_ms") {
+                None => None,
+                Some(d) => match d.as_i64() {
+                    Some(i) if i > 0 => Some(i),
+                    _ => return Err("gate_max_command_age_ms must be a positive integer".to_string()),
+                },
+            },
+            twist_limits: match v.get("twist_limits") {
+                None => None,
+                Some(t) => match (t.get("linear_mm_s").and_then(Value::as_i64), t.get("angular_mrad_s").and_then(Value::as_i64)) {
+                    (Some(l), Some(a)) if l > 0 && a > 0 => Some((l, a)),
+                    _ => return Err("twist_limits needs positive integers linear_mm_s and angular_mrad_s".to_string()),
+                },
+            },
             safe_state_action,
             software,
         })
@@ -136,10 +174,18 @@ impl Config {
     /// The part of the configuration every record reader needs, committed in the
     /// genesis record and again whenever the configuration changes.
     pub fn settings(&self) -> Value {
-        json!({
+        let mut settings = json!({
             "heartbeat_seconds": self.heartbeat_seconds,
             "measure_every": self.measure_every,
+            "recorder_public_key": self.recorder_public_key,
             "safe_state_action": self.safe_state_action,
-        })
+        });
+        if let Some(seconds) = self.gate_deadman_seconds {
+            settings["gate_deadman_seconds"] = json!(seconds);
+        }
+        if let Some(ms) = self.gate_max_command_age_ms {
+            settings["gate_max_command_age_ms"] = json!(ms);
+        }
+        settings
     }
 }

@@ -63,8 +63,12 @@ class Workspace:
         self.gate_state = os.path.join(self.dir, "actuator_side", "gate.state")
         self.actuator = os.path.join(self.dir, "actuator_side", "actuator.jsonl")
         self.witness_store = os.path.join(self.dir, "witness_side", "roots.jsonl")
+        self.key_file = os.path.join(self.dir, "recorder_private", "recorder.key")
         self.gate_exits = []
         self.witness = self.witness_port = None
+        if not fresh:
+            with open(os.path.join(self.installed, "config.json"), encoding="utf-8") as fh:
+                self.public_key = json.load(fh)["recorder_public_key"]
         if fresh:
             if os.path.isdir(self.dir):
                 for folder, _, files in os.walk(self.dir):
@@ -72,6 +76,16 @@ class Workspace:
                         os.chmod(os.path.join(folder, f), stat.S_IWRITE | stat.S_IREAD)
                 shutil.rmtree(self.dir)
             shutil.copytree(os.path.join(HERE, "installed"), self.installed)
+            # A fresh signing key for this run. The private half goes in a folder of its
+            # own, away from the journal. The public half goes into the configuration.
+            os.makedirs(os.path.dirname(self.key_file))
+            made = subprocess.run([recorder, "keygen", "--out", self.key_file], capture_output=True, text=True)
+            self.public_key = json.loads(made.stdout)["recorder_public_key"]
+            config_path = os.path.join(self.installed, "config.json")
+            with open(config_path, encoding="utf-8") as fh:
+                config = fh.read().replace('"recorder_public_key": ""', '"recorder_public_key": "%s"' % self.public_key)
+            with open(config_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(config)
             os.makedirs(os.path.dirname(self.gate_state))
             os.makedirs(os.path.dirname(self.witness_store))
 
@@ -106,12 +120,12 @@ class Workspace:
 
     def run_args(self, start_at):
         return [self.recorder, "run", "--dir", self.data, "--installed", self.installed,
-                "--link", self.link, "--start-at", start_at]
+                "--key", self.key_file, "--link", self.link, "--start-at", start_at]
 
     def gate(self):
         """Let the gate process whatever the recorder has sent. Returns its exit code."""
         code = python(GATE, "--link", self.link, "--state", self.gate_state, "--actuator", self.actuator,
-                      "--safe-state", SAFE_STATE).returncode
+                      "--safe-state", SAFE_STATE, "--public-key", self.public_key).returncode
         self.gate_exits.append(code)
         return code
 
@@ -129,7 +143,7 @@ class Workspace:
     def verify(self, *extra, root=None, witness=True, gate=True):
         """Run the verifier. Returns (exit code, its JSON report or {})."""
         args = [VERIFIER, self.journal, "--rulesets", os.path.join(self.data, "rulesets"),
-                "--decisions", os.path.join(self.data, "decisions"), "--json"]
+                "--decisions", os.path.join(self.data, "decisions"), "--public-key", self.public_key, "--json"]
         if root is not None:
             args += ["--root", str(root)]
         if witness:

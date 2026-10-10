@@ -4,6 +4,7 @@ import os
 
 import pytest
 
+import pure_ed25519 as ed
 import run_scenarios
 import verify_journal as vj
 
@@ -38,18 +39,26 @@ def write(w, entries):
             fh.write(json.dumps(e) + "\n")
 
 
-def forge(w, change):
+def forge(w, change, with_the_key=True):
     """Rewrite the journal the way someone who understands the format would: apply
     `change` to the parsed records, then repair every leaf hash, every `prev`, the root,
     the state file and the anchor statements kept beside the journal. Returns the
-    forger's own root."""
+    forger's own root.
+
+    `with_the_key`: the forger is the operator, who can read the recorder's private key
+    and signs every rewritten record again. Without it the old signatures are left on
+    records whose contents have changed."""
     entries = entries_of(w)
     records = [json.loads(e["raw"]) for e in entries]
     records = change(records) or records
+    with open(w.key_file, encoding="utf-8") as fh:
+        seed = bytes.fromhex(fh.read().strip())
     prev = ""
     forged = []
     for n, rec in enumerate(records):
         rec["n"], rec["prev"] = n, prev
+        if with_the_key:
+            rec = records[n] = ed.sign_record(seed, rec)
         raw = json.dumps(rec, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         prev = vj.leaf_hash(raw.encode("utf-8")).hex()
         forged.append({"seq": n, "ingested_at": entries[min(n, len(entries) - 1)]["ingested_at"],
@@ -113,6 +122,60 @@ def never_asked_for_1800(records):
     records[3]["reported"] = {"applied": {"speed_mm_s": 1400}, "outcome": "unchanged", "rules_acted": []}
 
 
+def test_a_rewrite_by_someone_without_the_key_fails_the_signature_check(run2):
+    """An outsider who can write to the journal but cannot read the recorder's key. Every
+    hash and the root are repaired. The verifier is given nothing from outside the
+    journal's directory, and still finds it: each record whose contents changed carries a
+    signature that no longer fits. That is record 3, and every record after it, because
+    each names the hash of the one before."""
+    w, _ = run2
+    forged_root = forge(w, never_asked_for_1800, with_the_key=False)
+    code, report = w.verify(root=forged_root, **ALONE)
+    assert code == 2 and findings(report) == ["SIGNATURE_INVALID"]
+    assert [f["n"] for f in report["findings"]] == [3, 4, 5, 6]
+
+
+def test_a_record_with_its_signature_removed(run2):
+    w, _ = run2
+
+    def strip(records):
+        del records[2]["sig"]
+
+    code, report = w.verify(root=forge(w, strip, with_the_key=False), **ALONE)
+    assert code == 2 and "SIGNATURE_MISSING" in findings(report)
+
+
+def test_a_journal_signed_with_a_different_key_than_the_machines(run2):
+    """The whole journal re-signed with the forger's own key, with that key written into
+    the first record. Inside the journal everything agrees. Given the public key from the
+    machine's configuration, the verifier sees it is not this machine's journal."""
+    w, _ = run2
+    other = bytes(range(32))
+    entries = entries_of(w)
+    prev, forged = "", []
+    for n, e in enumerate(entries):
+        rec = json.loads(e["raw"])
+        rec["n"], rec["prev"] = n, prev
+        if n == 0:
+            rec["settings"]["recorder_public_key"] = ed.public_key(other).hex()
+        raw = json.dumps(ed.sign_record(other, rec), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        prev = vj.leaf_hash(raw.encode("utf-8")).hex()
+        forged.append(dict(e, hash=prev, raw=raw))
+    write(w, forged)
+    root = vj.merkle_root([bytes.fromhex(e["hash"]) for e in forged]).hex()
+    code, report = w.verify(root=root, **ALONE)
+    assert code == 2 and findings(report) == ["KEY_MISMATCH"]
+
+
+def test_a_clamped_command_records_both_what_was_asked_and_what_was_applied(run2):
+    w, _ = run2
+    clamped = json.loads(entries_of(w)[3]["raw"])
+    assert clamped["requested"] == {"speed_mm_s": 1800}
+    assert clamped["applied"] == {"speed_mm_s": 1500}
+    assert (clamped["outcome"], clamped["rules_acted"]) == ("changed", ["R2-speed-limit"])
+    assert clamped["reported"]["applied"] == {"speed_mm_s": 1500}
+
+
 def test_a_full_rewrite_fails_against_the_published_root(run2):
     w, published = run2
     forge(w, raise_the_clamped_speed)
@@ -131,10 +194,12 @@ def test_a_full_rewrite_with_its_own_root_still_fails_the_rule_check(run2):
 
 
 def test_a_self_consistent_rewrite_passes_when_nothing_outside_the_journal_is_consulted(run2):
-    """The limit, shown and not hidden. A forger who rewrites the request, the outcome,
+    """The limit, shown and not hidden. A forger who can read the recorder's private key,
+    which the operator can, and who rewrites the request, the outcome, every signature,
     every hash, the root, the state file and the anchor statements kept beside the
-    journal produces a journal with no findings, as long as the verifier is given only
-    things the forger can reach."""
+    journal, produces a journal with no findings, as long as the verifier is given only
+    things the forger can reach. Signatures stop an outsider. They do not stop the
+    operator."""
     w, _ = run2
     forged_root = forge(w, never_asked_for_1800)
     code, report = w.verify("--anchors", os.path.join(w.data, "anchors"), root=forged_root, **ALONE)

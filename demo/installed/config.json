@@ -2,6 +2,7 @@
   "machine": "demo-conveyor-1",
   "heartbeat_seconds": 60,
   "measure_every": 5,
+  "recorder_public_key": "",
   "anchor_every": 4,
   "safe_state_action": {"speed_mm_s": 0},
   "units": {"speed_mm_s": "millimetres per second"},

@@ -1,0 +1,9 @@
+{
+  "ruleset_id": "mobile-base-rules-1",
+  "kind": "declared",
+  "rules": [
+    {"id": "R1-light-curtain", "type": "block_when", "input": "light_curtain_clear", "op": "eq", "value": 0},
+    {"id": "R2-forward-speed", "type": "clamp", "field": "linear_x_mm_s", "min": -1500, "max": 1500},
+    {"id": "R3-turn-rate", "type": "clamp", "field": "angular_z_mrad_s", "min": -2000, "max": 2000}
+  ]
+}

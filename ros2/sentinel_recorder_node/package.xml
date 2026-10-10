@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>sentinel_recorder_node</name>
+  <version>0.1.0</version>
+  <description>Sentinel Ledger recorder as a ROS 2 node: Twist in, recorded commands out.</description>
+  <maintainer email="jak.potvin@gmail.com">Jak Potvin</maintainer>
+  <license>MIT</license>
+
+  <depend>rclrs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <export>
+    <build_type>ament_cargo</build_type>
+  </export>
+</package>

@@ -1,0 +1,20 @@
+[package]
+name = "sentinel_recorder_node"
+version = "0.1.0"
+edition = "2021"
+description = "Sentinel Ledger recorder as a ROS 2 node: Twist in, recorded commands out"
+
+[dependencies]
+sentinel-recorder = { path = "../../recorder" }
+rclrs = "0.8"
+ros-env = "0.3"
+serde_json = "1"
+libc = "0.2"
+
+# Deliberate bugs for ros2/test_ros2.py. Never enable one in a real build.
+[features]
+# A test seam, not a bug: one flush can be made slow with SL_TEST_SLOW_FLUSH.
+test-slow-flush = ["sentinel-recorder/test-slow-flush"]
+planted-bug-twist-accepts-nonfinite = ["sentinel-recorder/planted-bug-twist-accepts-nonfinite"]
+planted-bug-ros-drops-a-record = []
+planted-bug-forward-first = ["sentinel-recorder/planted-bug-forward-first"]

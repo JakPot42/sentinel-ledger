@@ -1,6 +1,7 @@
 //! Command line for the recorder.
 //!
-//!     sentinel-recorder run --dir DATA --installed DIR --link FILE [--start-at T]
+//!     sentinel-recorder keygen --out FILE
+//!     sentinel-recorder run --dir DATA --installed DIR --key FILE --link FILE [--start-at T]
 //!     sentinel-recorder root --dir DATA
 //!     sentinel-recorder receipt --dir DATA --n N
 //!
@@ -15,7 +16,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use logchain::journal::{DataPaths, leaf_hashes, load_state, read_entries};
 use logchain::report::build_inclusion_proof;
-use sentinel_recorder::recorder::{Clock, Fail, Recorder, parse_at};
+use sentinel_recorder::recorder::{Clock, Fail, Link, Recorder, parse_at};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -35,6 +36,10 @@ enum Command {
         /// Installed files: config.json, ruleset.json and the software they name.
         #[arg(long)]
         installed: PathBuf,
+        /// The recorder's private signing key (made with `keygen`). Keep it outside the
+        /// data directory and readable by the recorder's user only.
+        #[arg(long)]
+        key: PathBuf,
         /// The wire to the actuator-side gate: a file each forwarded record is appended to.
         #[arg(long)]
         link: PathBuf,
@@ -42,6 +47,12 @@ enum Command {
         /// per record. For reproducible demos. Without it the system clock is used.
         #[arg(long)]
         start_at: Option<String>,
+    },
+    /// Make a signing key. Writes the private key to a new file and prints the public key,
+    /// which goes in the configuration file as recorder_public_key.
+    Keygen {
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Print the current Merkle root from the state file.
     Root {
@@ -71,7 +82,7 @@ fn safe_state_without_recorder(link: &Path) {
     }
 }
 
-fn run(dir: &Path, installed: &Path, link: &Path, start_at: Option<String>) -> ExitCode {
+fn run(dir: &Path, installed: &Path, key: &Path, link: &Path, start_at: Option<String>) -> ExitCode {
     let clock = match start_at {
         None => Clock::System,
         Some(text) => match parse_at(&text) {
@@ -82,7 +93,7 @@ fn run(dir: &Path, installed: &Path, link: &Path, start_at: Option<String>) -> E
             }
         },
     };
-    let mut recorder = match Recorder::open(dir, installed, link, clock) {
+    let mut recorder = match Recorder::open(dir, installed, key, Link::File(link.to_path_buf()), clock) {
         Ok(r) => r,
         Err(e) => {
             safe_state_without_recorder(link);
@@ -141,7 +152,17 @@ fn run(dir: &Path, installed: &Path, link: &Path, start_at: Option<String>) -> E
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Run { dir, installed, link, start_at } => run(&dir, &installed, &link, start_at),
+        Command::Run { dir, installed, key, link, start_at } => run(&dir, &installed, &key, &link, start_at),
+        Command::Keygen { out } => match sentinel_recorder::signing::generate(&out) {
+            Ok(public) => {
+                say(json!({"recorder_public_key": public}));
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        },
         Command::Root { dir } => match load_state(&DataPaths::from_dir(&dir).state) {
             Ok(state) => {
                 say(json!({"root": state.merkle_root, "entries": state.entry_count}));

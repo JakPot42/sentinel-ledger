@@ -6,14 +6,15 @@ recorder or from LogChain, shells out to nothing, and uses only the Python stand
 library, so it can be read, audited and run on its own.
 
     verify_journal.py JOURNAL --rulesets DIR [--root HEX] [--witness-store FILE]
-                      [--anchors DIR] [--gate-state FILE] [--decisions DIR]
+                      [--anchors DIR] [--gate-state FILE] [--decisions DIR] [--public-key HEX]
                       [--profile FILE --as-of YYYY-MM-DD] [--json]
     verify_journal.py --receipt FILE --root HEX
 
 Three levels, and it stops at the first one that fails:
   1. the chain: every leaf hash, then the Merkle root (LogChain format version 2), then
      every anchored root it was given and the head the actuator-side gate holds;
-  2. the records: position, order, the state in force, and which rule acted;
+  2. the records: position, order, each record's signature, the state in force, and
+     which rule acted;
   3. a profile, when one is given: which records it maps to a rule, and retention.
 
 Exit codes: 0 clean, 2 at least one finding, 1 usage or I/O error.
@@ -32,7 +33,7 @@ SCHEMA = "sentinel-ledger/record/0"
 RECEIPT_SCHEMA = "sentinel-ledger/receipt/0"
 PROFILE_SCHEMA = "sentinel-ledger/profile/0"
 KINDS = ("genesis", "recorder_start", "recorder_stop", "command", "intervention_declared",
-         "intervention_detected", "heartbeat", "recorder_fault")
+         "intervention_detected", "heartbeat", "recorder_fault", "storage_stall", "anchor_failed")
 AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 OPS = {"lt": lambda a, b: a < b, "le": lambda a, b: a <= b, "eq": lambda a, b: a == b,
@@ -193,6 +194,80 @@ def check_gate(entries, path):
     return [], info
 
 
+# --- Ed25519 verification, RFC 8032. Verification only: no private key is ever here. ---
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+
+
+def _point_add(a, b):
+    f = (a[1] - a[0]) * (b[1] - b[0]) % _P
+    g = (a[1] + a[0]) * (b[1] + b[0]) % _P
+    c = 2 * a[3] * b[3] * _D % _P
+    d = 2 * a[2] * b[2] % _P
+    e, ff, gg, h = g - f, d - c, d + c, g + f
+    return (e * ff % _P, gg * h % _P, ff * gg % _P, e * h % _P)
+
+
+def _point_mul(scalar, point):
+    result = (0, 1, 1, 0)
+    while scalar > 0:
+        if scalar & 1:
+            result = _point_add(result, point)
+        point = _point_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _point_from_bytes(data):
+    y = int.from_bytes(data, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P) % _P
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P != 0:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    if (x * x - x2) % _P != 0 or (x == 0 and sign):
+        return None
+    if (x & 1) != sign:
+        x = _P - x
+    return (x, y, 1, x * y % _P)
+
+
+_BASE = _point_from_bytes((4 * pow(5, _P - 2, _P) % _P).to_bytes(32, "little"))
+
+
+def ed25519_verify(public, message, signature):
+    """True only if `signature` (64 bytes) is a valid Ed25519 signature of `message` under
+    the public key `public` (32 bytes)."""
+    if len(public) != 32 or len(signature) != 64:
+        return False
+    a, r = _point_from_bytes(public), _point_from_bytes(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= _L:
+        return False
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little") % _L
+    left, right = _point_mul(s, _BASE), _point_add(r, _point_mul(k, a))
+    return ((left[0] * right[2] - right[0] * left[2]) % _P == 0
+            and (left[1] * right[2] - right[1] * left[2]) % _P == 0)
+
+
+def signature_ok(record, public_hex):
+    """A record's `sig` must be a signature, under the recorder's public key, of the
+    canonical form of every other field of the record."""
+    sig = record.get("sig")
+    if not isinstance(sig, str) or len(sig) != 128:
+        return False
+    body = {k: v for k, v in record.items() if k != "sig"}
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    try:
+        return ed25519_verify(bytes.fromhex(public_hex), text.encode("utf-8"), bytes.fromhex(sig))
+    except ValueError:
+        return False
+
+
 # --- level 2: the records --------------------------------------------------------------
 
 def _no_floats(text):
@@ -318,7 +393,13 @@ def good_state(state):
 
 def good_settings(settings):
     return (isinstance(settings, dict) and type(settings.get("heartbeat_seconds")) is int
-            and settings["heartbeat_seconds"] > 0)
+            and settings["heartbeat_seconds"] > 0 and isinstance(settings.get("recorder_public_key"), str)
+            and HEX64.match(settings["recorder_public_key"]) is not None)
+
+
+def good_stall(rec):
+    return (isinstance(rec.get("step"), str) and type(rec.get("of_record")) is int and rec["of_record"] >= 0
+            and type(rec.get("stalled_ms")) is int and rec["stalled_ms"] > 0)
 
 
 def good_command(rec):
@@ -338,21 +419,24 @@ def good_command(rec):
             return "applied must be an object or null"
         if not isinstance(where["rules_acted"], list):
             return "rules_acted must be a list"
+    if "received_ms" in rec and type(rec["received_ms"]) is not int:
+        return "received_ms must be an integer"
     if ("decision_sha256" in rec) != ("decision_bytes" in rec):
         return "decision_sha256 and decision_bytes go together"
     return None
 
 
-def check_records(entries, rulesets, decisions_dir):
+def check_records(entries, rulesets, decisions_dir, expected_key=None):
     findings = []
     counts = {"records": len(entries), "commands": 0, "unchanged": 0, "changed": 0, "blocked": 0,
               "not_recomputed": 0, "interventions_declared": 0, "interventions_detected": 0,
-              "heartbeats": 0, "recorder_faults": 0, "restarts_without_stop": 0,
-              "decisions_named": 0, "decisions_checked": 0, "decision_absent": 0}
+              "heartbeats": 0, "recorder_faults": 0, "storage_stalls": 0, "anchors_failed": 0,
+              "restarts_without_stop": 0,
+              "decisions_named": 0, "decisions_checked": 0, "decision_absent": 0, "signatures_checked": 0}
     downtime = []
     records = []
     parsed_rulesets = {}
-    state = settings = None
+    state = settings = key = None
     prev_hash, prev_at, prev_kind = "", None, None
 
     def add(kind, n, **more):
@@ -384,14 +468,31 @@ def check_records(entries, rulesets, decisions_dir):
             if gap > 2 * settings["heartbeat_seconds"]:
                 if prev_kind == "recorder_stop" and kind == "recorder_start":
                     downtime.append({"from": prev_at, "to": rec["at"], "seconds": gap})
+                elif kind == "storage_stall" and good_stall(rec) and \
+                        gap * 1000 - rec["stalled_ms"] <= 2 * settings["heartbeat_seconds"] * 1000:
+                    # The recorder says storage held it up, and for long enough to account
+                    # for this gap. It is reported below as STORAGE_STALL: still a finding.
+                    pass
                 else:
                     add("HEARTBEAT_GAP", position, seconds=gap, previous=prev_at, at=rec["at"])
 
         if kind == "genesis" and position == 0:
             if good_state(rec.get("state")) and good_settings(rec.get("settings")):
                 state, settings = json.loads(canonical(rec["state"])), rec["settings"]
+                key = settings["recorder_public_key"]
+                if expected_key is not None and key != expected_key:
+                    add("KEY_MISMATCH", position, journal_key=key, expected_key=expected_key)
             else:
                 add("RECORD_MALFORMED", position, reason="genesis lacks a usable state or settings")
+        # Every record, the first included, must be signed with the key the first record names.
+        if key is not None:
+            counts["signatures_checked"] += 1
+            if "sig" not in rec:
+                add("SIGNATURE_MISSING", position)
+            elif not signature_ok(rec, key):
+                add("SIGNATURE_INVALID", position)
+        if kind == "genesis" and position == 0:
+            pass
         elif kind == "recorder_start":
             if prev_kind not in ("genesis", "recorder_stop"):
                 counts["restarts_without_stop"] += 1
@@ -399,6 +500,23 @@ def check_records(entries, rulesets, decisions_dir):
             counts["heartbeats"] += 1
         elif kind == "recorder_fault":
             counts["recorder_faults"] += 1
+        elif kind == "anchor_failed":
+            counts["anchors_failed"] += 1
+            if type(rec.get("entry_count")) is not int or not isinstance(rec.get("detail"), str):
+                add("RECORD_MALFORMED", position, reason="an anchor_failed record needs entry_count and detail")
+            else:
+                # The recorder states that an anchor statement could not be written. The
+                # records it would have covered have one piece of outside evidence fewer.
+                add("ANCHOR_FAILED", position, entry_count=rec["entry_count"], detail=rec["detail"])
+        elif kind == "storage_stall":
+            counts["storage_stalls"] += 1
+            if not good_stall(rec):
+                add("RECORD_MALFORMED", position, reason="a storage_stall record needs step, of_record and stalled_ms")
+            else:
+                # Every stall the recorder states is a finding, whether or not it was long
+                # enough to leave a gap between two records' times.
+                add("STORAGE_STALL", position, step=rec["step"], of_record=rec["of_record"],
+                    stalled_ms=rec["stalled_ms"], previous=prev_at, at=rec["at"])
         elif kind in ("intervention_declared", "intervention_detected"):
             counts["interventions_declared" if kind.endswith("declared") else "interventions_detected"] += 1
             if kind == "intervention_declared":
@@ -419,7 +537,9 @@ def check_records(entries, rulesets, decisions_dir):
                             reason="the record's previous value is not the replayed value")
                     set_target(state, change["target"], change.get("measured"))
                     if change["target"] == "config":
-                        if good_settings(rec.get("settings")):
+                        if good_settings(rec.get("settings")) and rec["settings"]["recorder_public_key"] != key:
+                            add("RECORD_MALFORMED", position, reason="a change of the recorder's key; key rotation is not supported")
+                        elif good_settings(rec.get("settings")):
                             settings = rec["settings"]
                         else:
                             add("RECORD_MALFORMED", position, reason="a configuration change without settings")
@@ -607,11 +727,17 @@ def show(result):
         out.append("interventions:    %d declared, %d detected by measurement"
                    % (c["interventions_declared"], c["interventions_detected"]))
         out.append("heartbeats:       %d" % c["heartbeats"])
+        out.append("signatures:       %d record(s) checked against the key named in the first record" % c["signatures_checked"])
         out.append("decision files:   %d named, %d present and matching their hash, %d absent"
                    % (c["decisions_named"], c["decisions_checked"], c["decision_absent"]))
         if c["recorder_faults"] or c["restarts_without_stop"]:
             out.append("recorder:         %d fault record(s), %d start(s) with no stop before"
                        % (c["recorder_faults"], c["restarts_without_stop"]))
+        if c.get("anchors_failed"):
+            out.append("anchors:          %d the recorder states it could not write (each is a finding below)"
+                       % c["anchors_failed"])
+        if c.get("storage_stalls"):
+            out.append("storage stalls:   %d stated by the recorder (each is a finding below)" % c["storage_stalls"])
         for d in result.get("downtime", []):
             out.append("stopped:          %s to %s (%d s), between a stop and a start"
                        % (d["from"], d["to"], d["seconds"]))
@@ -697,7 +823,7 @@ def run(args):
     if not findings:
         result["level_reached"] = 2
         findings, result["counts"], result["downtime"], records = check_records(
-            entries, load_rulesets(args.rulesets), args.decisions)
+            entries, load_rulesets(args.rulesets), args.decisions, args.public_key)
         if not findings and profile is not None:
             result["level_reached"] = 3
             findings, provisions = check_profile(profile, records, args.decisions, as_of)
@@ -715,6 +841,8 @@ def main(argv=None):
     ap.add_argument("--witness-store", help="a witness's store of anchored roots; every one must match")
     ap.add_argument("--anchors", help="directory of anchor statements (for example timestamped ones); every one must match")
     ap.add_argument("--gate-state", help="the actuator-side gate's state file; its head must be in the journal")
+    ap.add_argument("--public-key", help="the recorder's public key, from the machine's configuration; "
+                    "the key the journal names must be this one")
     ap.add_argument("--rulesets", help="directory holding the ruleset files the journal names")
     ap.add_argument("--decisions", help="directory holding decision files, named by their SHA-256")
     ap.add_argument("--profile", help="a profile file to report against (level 3)")

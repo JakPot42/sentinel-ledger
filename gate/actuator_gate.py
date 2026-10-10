@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The actuator-side gate. docs/SPEC.md section 4.2.
 
-    actuator_gate.py --link FILE --state FILE --actuator FILE --safe-state JSON
+    actuator_gate.py --link FILE --state FILE --actuator FILE --safe-state JSON --public-key HEX
 
 It stands between the recorder and the actuator, on the actuator's side. It holds the
 number and hash of the last record it accepted, and passes a command on only when the
@@ -10,13 +10,19 @@ passes on is read out of the record. Nothing the recorder says beside the record
 used.
 
 It shares no code with the recorder or the verifier and uses only the Python standard
-library. In a real machine this logic belongs in the actuator's own controller. Here it
-is a program that reads the messages the recorder wrote to the link file since it last
-ran, which gives the same answers as running in line because the gate's decisions depend
-only on the order of the messages.
+library. In a real machine this logic belongs in the actuator's own controller. It is
+used two ways here:
+
+  - as this program, which reads the messages the recorder wrote to a link file since it
+    last ran (the file demo);
+  - as the `Gate` class, held inside the simulated robot's own process and given each
+    message as it arrives on a ROS topic (ros2/sim_robot.py).
 
 What it checks for each record message:
   - the hash it carries is SHA-256(0x00 || record text), LogChain's leaf hash;
+  - the record is signed by the recorder: its `sig` is an Ed25519 signature, under the
+    public key the gate was started with, of the record's other fields. The gate holds
+    the public key only. It cannot sign;
   - the record's `n` is one more than the last accepted, and its `prev` is the last
     accepted hash. The first record ever accepted must be a genesis record with n = 0;
   - for a command record, the outcome and the applied command agree in form.
@@ -26,10 +32,29 @@ What it does:
     the safe-state action goes to the actuator;
   - a refused message: the safe-state action goes to the actuator, and the gate's state
     does not move;
-  - a safe-state message from the recorder: always obeyed. Stopping needs no record.
+  - a safe-state message from the recorder: always obeyed. Stopping needs no record;
+  - the deadman, when the gate is given one (`deadman_seconds`, from the machine's
+    configuration) and is run against a clock: once it has accepted a record, if no valid
+    record follows within that many seconds, the safe-state action goes to the actuator.
+    Heartbeat records count, so a quiet recorder that is alive keeps the actuator's last
+    command in force and a silent one does not. Only an accepted record counts: refused
+    messages and safe-state messages do not. The `Gate` class has this; whoever holds it
+    must call `check_deadman` regularly. This program, reading a file after the fact, has
+    no clock to run it against and does not;
+  - a command that is too old, when the gate is given a limit (`max_command_age_ms`, from
+    the machine's configuration) and a wall-clock reading: a command record carries
+    `received_ms`, the time the recorder received the command. If that is more than the
+    limit before the gate's own clock, or more than the limit after it, the command is
+    not carried out and the safe-state action goes to the actuator. The record is still
+    taken into the chain, because it is a genuine record and the ones after it follow
+    it; only its action is refused. A command with no `received_ms` is refused the same
+    way. The gate's clock and the recorder's are the same clock only on one machine:
+    across machines this check needs them synchronized, which nothing here does.
 
 What it cannot check: that the record it was shown was ever written to the journal. It
-keeps its head (state file) so that can be compared with the journal afterwards.
+keeps its head (state file) so that can be compared with the journal afterwards. And a
+signature shows who holds the private key, so anyone who can read the recorder's key file
+can make records the gate accepts.
 
 Exit codes: 0 every message accepted, 2 at least one refused, 1 usage or I/O error.
 """
@@ -44,23 +69,81 @@ def leaf_hash(text):
     return hashlib.sha256(b"\x00" + text.encode("utf-8")).hexdigest()
 
 
-def load_state(path):
-    if not os.path.exists(path):
-        return {"n": -1, "hash": "", "offset": 0}
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+# --- Ed25519 verification, RFC 8032. Verification only: no private key is ever here. ---
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
 
 
-def save_state(path, state):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(state, fh, sort_keys=True)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+def _point_add(a, b):
+    f = (a[1] - a[0]) * (b[1] - b[0]) % _P
+    g = (a[1] + a[0]) * (b[1] + b[0]) % _P
+    c = 2 * a[3] * b[3] * _D % _P
+    d = 2 * a[2] * b[2] % _P
+    e, ff, gg, h = g - f, d - c, d + c, g + f
+    return (e * ff % _P, gg * h % _P, ff * gg % _P, e * h % _P)
 
 
-def judge(message, state):
+def _point_mul(scalar, point):
+    result = (0, 1, 1, 0)
+    while scalar > 0:
+        if scalar & 1:
+            result = _point_add(result, point)
+        point = _point_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _point_from_bytes(data):
+    y = int.from_bytes(data, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P) % _P
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P != 0:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    if (x * x - x2) % _P != 0 or (x == 0 and sign):
+        return None
+    if (x & 1) != sign:
+        x = _P - x
+    return (x, y, 1, x * y % _P)
+
+
+_BASE = _point_from_bytes((4 * pow(5, _P - 2, _P) % _P).to_bytes(32, "little"))
+
+
+def ed25519_verify(public, message, signature):
+    """True only if `signature` (64 bytes) is a valid Ed25519 signature of `message` under
+    the public key `public` (32 bytes)."""
+    if len(public) != 32 or len(signature) != 64:
+        return False
+    a, r = _point_from_bytes(public), _point_from_bytes(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= _L:
+        return False
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little") % _L
+    left, right = _point_mul(s, _BASE), _point_add(r, _point_mul(k, a))
+    return ((left[0] * right[2] - right[0] * left[2]) % _P == 0
+            and (left[1] * right[2] - right[1] * left[2]) % _P == 0)
+
+
+def signature_ok(record, public_hex):
+    """A record's `sig` must be a signature, under the recorder's public key, of the
+    canonical form of every other field of the record."""
+    sig = record.get("sig")
+    if not isinstance(sig, str) or len(sig) != 128:
+        return False
+    body = {k: v for k, v in record.items() if k != "sig"}
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    try:
+        return ed25519_verify(bytes.fromhex(public_hex), text.encode("utf-8"), bytes.fromhex(sig))
+    except ValueError:
+        return False
+
+
+def judge(message, state, public_key):
     """Returns (record or None, reason for refusal or None)."""
     raw, claimed = message.get("record"), message.get("hash")
     if not isinstance(raw, str) or not isinstance(claimed, str):
@@ -75,6 +158,8 @@ def judge(message, state):
         return None, "the record has no number"
     if message.get("n") != record["n"]:
         return None, "the message's number is not the record's"
+    if not signature_ok(record, public_key):
+        return record, "the record is not signed by the recorder"
     if state["n"] < 0:
         if record.get("kind") != "genesis" or record["n"] != 0 or record.get("prev") != "":
             return record, "the first record must be a genesis record"
@@ -91,18 +176,101 @@ def judge(message, state):
     return record, None
 
 
+class Gate:
+    """The gate's whole kept state is `n` and `hash`: the last record it accepted. The
+    deadman's clock is not kept: it starts again with the process."""
+
+    def __init__(self, state_path, safe_state, public_key, deadman_seconds=None, max_command_age_ms=None):
+        self.state_path = state_path
+        self.safe_state = safe_state
+        self.public_key = public_key
+        self.deadman_seconds = deadman_seconds
+        self.max_command_age_ms = max_command_age_ms
+        self.last_valid = None   # when the last record was accepted, on the caller's monotonic clock
+        self.tripped = False
+        self.state = {"n": -1, "hash": "", "offset": 0}
+        if os.path.exists(state_path):
+            with open(state_path, "r", encoding="utf-8") as fh:
+                self.state = json.load(fh)
+
+    def save(self):
+        tmp = self.state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.state, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.state_path)
+
+    def check_deadman(self, now):
+        """Call this regularly with a monotonic clock reading, in seconds. Returns None,
+        or, the first time the silence since the last accepted record has passed
+        `deadman_seconds`, a decision that sends the safe state."""
+        if self.deadman_seconds is None or self.last_valid is None or self.tripped:
+            return None
+        silent = now - self.last_valid
+        if silent <= self.deadman_seconds:
+            return None
+        self.tripped = True
+        return {"accepted": None, "n": None, "send": self.safe_state, "why": "deadman", "reason": None,
+                "silent_seconds": round(silent, 3)}
+
+    def too_old(self, record, wall_ms):
+        """None, or why this command must not be carried out for its age."""
+        if self.max_command_age_ms is None or wall_ms is None:
+            return None
+        received = record.get("received_ms")
+        if type(received) is not int:
+            return "the command does not say when it was received"
+        age = wall_ms - received
+        if age > self.max_command_age_ms:
+            return "the command is %d ms old; the limit is %d ms" % (age, self.max_command_age_ms)
+        if age < -self.max_command_age_ms:
+            return "the command is dated %d ms ahead of the gate's clock; the limit is %d ms" % (
+                -age, self.max_command_age_ms)
+        return None
+
+    def handle(self, message, now=None, wall_ms=None):
+        """One message in, one decision out:
+        {"accepted": bool, "n": record number or None, "send": action for the actuator or
+        None, "why": why that action is sent, "reason": why the message was refused}.
+        `now` is a monotonic clock reading, for the deadman; leave it out and there is none.
+        `wall_ms` is the wall clock in milliseconds since 1970, for a command's age; leave
+        it out and no command is refused for its age."""
+        if not isinstance(message, dict):
+            message = {}
+        if message.get("type") == "safe_state":
+            return {"accepted": True, "n": None, "send": self.safe_state, "why": "recorder_fault", "reason": None}
+        record, reason = judge(message, self.state, self.public_key)
+        if reason:
+            return {"accepted": False, "n": None, "send": self.safe_state, "why": "gate_refused", "reason": reason}
+        self.state["n"], self.state["hash"] = record["n"], message["hash"]
+        if now is not None:
+            self.last_valid, self.tripped = now, False
+        decision = {"accepted": True, "n": record["n"], "send": None, "why": None, "reason": None}
+        if record.get("kind") == "command":
+            stale = self.too_old(record, wall_ms)
+            if stale is not None:
+                # The record is in the chain. Its action is not carried out.
+                decision.update(accepted=False, send=self.safe_state, why="stale_command", reason=stale)
+            elif record["outcome"] == "blocked":
+                decision.update(send=self.safe_state, why="blocked")
+            else:
+                decision.update(send=record["applied"], why="applied")
+        return decision
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Actuator-side gate for Sentinel Ledger.")
     ap.add_argument("--link", required=True, help="the file the recorder writes its messages to")
     ap.add_argument("--state", required=True, help="where the gate keeps the last accepted number and hash")
     ap.add_argument("--actuator", required=True, help="the simulated actuator: accepted actions are appended here")
     ap.add_argument("--safe-state", required=True, help="the safe-state action, as JSON, set on the actuator side")
+    ap.add_argument("--public-key", required=True, help="the recorder's Ed25519 public key, 64 hex characters")
     args = ap.parse_args(argv)
     try:
-        safe = json.loads(args.safe_state)
-        state = load_state(args.state)
+        gate = Gate(args.state, json.loads(args.safe_state), args.public_key)
         with open(args.link, "rb") as fh:
-            fh.seek(state["offset"])
+            fh.seek(gate.state["offset"])
             pending = fh.read()
     except (OSError, ValueError) as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -110,39 +278,28 @@ def main(argv=None):
 
     accepted = refused = 0
     with open(args.actuator, "a", encoding="utf-8", newline="\n") as actuator:
-        def send(n, action, why):
-            actuator.write(json.dumps({"n": n, "sent": action, "why": why}, sort_keys=True,
-                                      separators=(",", ":")) + "\n")
-            actuator.flush()
-
         # Only whole lines are consumed. A line still being written is left for next time.
         for line in pending.splitlines(keepends=True):
             if not line.endswith(b"\n"):
                 break
-            state["offset"] += len(line)
+            gate.state["offset"] += len(line)
             try:
                 message = json.loads(line.decode("utf-8"))
             except ValueError:
                 message = {}
-            if isinstance(message, dict) and message.get("type") == "safe_state":
-                send(None, safe, "recorder_fault")
-            else:
-                record, reason = judge(message if isinstance(message, dict) else {}, state)
-                if reason:
-                    refused += 1
-                    send(None, safe, "gate_refused")
-                    print("REFUSED: " + reason)
-                else:
-                    accepted += 1
-                    state["n"], state["hash"] = record["n"], message["hash"]
-                    if record.get("kind") == "command":
-                        if record["outcome"] == "blocked":
-                            send(record["n"], safe, "blocked")
-                        else:
-                            send(record["n"], record["applied"], "applied")
-            save_state(args.state, state)
+            decision = gate.handle(message)
+            if decision["send"] is not None:
+                actuator.write(json.dumps({"n": decision["n"], "sent": decision["send"], "why": decision["why"]},
+                                          sort_keys=True, separators=(",", ":")) + "\n")
+                actuator.flush()
+            if decision["reason"]:
+                refused += 1
+                print("REFUSED: " + decision["reason"])
+            elif decision["n"] is not None:
+                accepted += 1
+            gate.save()
 
-    print("gate: %d record(s) accepted, %d refused, head is record %d" % (accepted, refused, state["n"]))
+    print("gate: %d record(s) accepted, %d refused, head is record %d" % (accepted, refused, gate.state["n"]))
     return 2 if refused else 0
 
 
