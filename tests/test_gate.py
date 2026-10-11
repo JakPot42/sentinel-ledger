@@ -6,12 +6,17 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 import pure_ed25519 as ed
 import run_scenarios
+from actuator_gate import Gate
 
 SEED = bytes(range(32))            # the "recorder" in these tests
 PUBLIC = ed.public_key(SEED).hex()
 OTHER_SEED = bytes(range(1, 33))   # someone else's key
+GATE_SEED = bytes(range(100, 132))  # the gate's own key, for its receipts
+SAFE = {"speed_mm_s": 0}
 
 
 def leaf(text):
@@ -159,6 +164,137 @@ def test_after_a_refusal_the_gate_still_accepts_the_record_that_does_follow(tmp_
     assert line.send({"type": "record", "n": 9, "hash": "00", "record": "{}"}).returncode == 2
     assert line.send(line.command(300)).returncode == 0
     assert line.sent() == [("gate_refused", 0), ("applied", 300)]
+
+
+# --- the record's text must be its canonical form ----------------------------------------
+#
+# The gate checks a record's signature over a re-serialisation of the parsed record. Until
+# it also compared the text it was sent with that canonical form, it accepted the same
+# signed record in any other encoding, and its head became a hash the journal does not
+# hold. The verifier already required the canonical form. docs/SPEC.md sections 4.2, 7.1.
+
+# What a node with no key can do to a genuine record's text without changing what it says.
+ENCODINGS = [
+    ("spaces after the separators", lambda raw: json.dumps(json.loads(raw), sort_keys=True)),
+    ("keys in another order",
+     lambda raw: json.dumps(dict(reversed(list(json.loads(raw).items()))), separators=(",", ":"))),
+    ("spread over several lines", lambda raw: json.dumps(json.loads(raw), sort_keys=True, indent=1)),
+    ("a key given twice", lambda raw: raw[:-1] + ',"n":%d}' % json.loads(raw)["n"]),
+    ("a key given twice, another action first", lambda raw: '{"applied":{"speed_mm_s":1500},' + raw[1:]),
+    ("a trailing newline", lambda raw: raw + "\n"),
+    ("trailing spaces", lambda raw: raw + "  "),
+    ("a leading space", lambda raw: " " + raw),
+    ("zero written as -0", lambda raw: raw.replace('"spare":0', '"spare":-0')),
+    ("a letter written as an escape", lambda raw: raw.replace('"kind":"command"', '"kind":"comm\\u0061nd"')),
+]
+SPACED = ENCODINGS[0][1]
+
+
+def in_another_encoding(message, encode):
+    """The message a node with no key can make from a genuine one: the same record in other
+    bytes, with the hash that belongs to those bytes. Nothing is signed again."""
+    text = encode(message["record"])
+    assert text != message["record"] and json.loads(text) == json.loads(message["record"])
+    return dict(message, hash=leaf(text), record=text)
+
+
+@pytest.mark.parametrize("encode", [encode for _, encode in ENCODINGS], ids=[name for name, _ in ENCODINGS])
+def test_a_genuine_record_in_another_encoding_is_refused_and_the_gate_does_not_move(encode, tmp_path):
+    line = Line(str(tmp_path))
+    gate = Gate(line.state, SAFE, PUBLIC, gate_key=GATE_SEED)
+    gate.handle(line.record("genesis"))
+    first = line.command(500)
+    assert gate.handle(first)["send"] == {"speed_mm_s": 500}
+    genuine = line.command(700, spare=0)
+
+    decision = gate.handle(in_another_encoding(genuine, encode))
+    assert (decision["accepted"], decision["why"], decision["n"]) == (False, "gate_refused", None)
+    assert decision["reason"] == "the record is not in canonical form"
+    # The actuator gets the safe state, as for every refusal, and not the 700 in the record.
+    assert decision["send"] == SAFE
+    # The gate's head is still the last record it accepted.
+    assert (gate.state["n"], gate.state["hash"]) == (1, first["hash"])
+    receipt = gate.issue_receipt(decision)
+    assert (receipt["decision"], receipt["reason"], receipt["detail"]) == (
+        "refused", "form", "the record is not in canonical form")
+    assert (receipt["n"], receipt["hash"], receipt["sent"]) == (None, None, SAFE)
+
+    # The record as the recorder wrote it is still the next one, and it is carried out.
+    after = gate.handle(genuine)
+    assert (after["accepted"], after["why"], after["send"]) == (True, "applied", {"speed_mm_s": 700})
+    assert (gate.state["n"], gate.state["hash"]) == (2, genuine["hash"])
+
+
+def test_a_record_that_is_neither_canonical_nor_signed_by_the_recorder_is_refused_for_its_form(tmp_path):
+    """One predictable reason. The checks on a message's form come before the signature."""
+    line = Line(str(tmp_path))
+    gate = Gate(line.state, SAFE, PUBLIC, gate_key=GATE_SEED)
+    gate.handle(line.record("genesis"))
+    decision = gate.handle(in_another_encoding(line.command(1500, seed=OTHER_SEED), SPACED))
+    assert gate.issue_receipt(decision)["reason"] == "form"
+    assert decision["send"] == SAFE and gate.state["n"] == 0
+
+
+def test_a_whole_number_rewritten_as_a_decimal_is_refused_too_for_its_signature(tmp_path):
+    """`0` written as `0.0` is written out again as `0.0`, so the check of the form passes
+    it, and Python reads the two numbers as equal. The signature does not: the signed
+    text has `0`. So this copy is refused one step later."""
+    line = Line(str(tmp_path))
+    gate = Gate(line.state, SAFE, PUBLIC, gate_key=GATE_SEED)
+    gate.handle(line.record("genesis"))
+    genuine = line.command(700, spare=0)
+    decimal = in_another_encoding(genuine, lambda raw: raw.replace('"spare":0', '"spare":0.0'))
+    decision = gate.handle(decimal)
+    assert (decision["accepted"], decision["send"], gate.state["n"]) == (False, SAFE, 0)
+    assert gate.issue_receipt(decision)["reason"] == "signature"
+    assert gate.handle(genuine)["send"] == {"speed_mm_s": 700}
+
+
+def test_text_nested_too_deeply_to_write_out_again_is_refused_and_is_not_an_error(tmp_path, monkeypatch):
+    """Text can be parsed and still be nested too deeply to write out again: Python gives
+    up with RecursionError. Seen with objects nested 10,000 deep on Windows and 50,000
+    deep under WSL; the depth depends on the interpreter's stack. The check of the form
+    must turn that into a refusal and not let it out of the gate. The failure is forced
+    here, so the test does not depend on the size of anyone's stack."""
+    import actuator_gate
+    line = Line(str(tmp_path))
+    gate = Gate(line.state, SAFE, PUBLIC)
+    gate.handle(line.record("genesis"))
+    nested = '{"a":' * 50 + "1" + "}" * 50
+    genuine = line.command(500)
+
+    def too_deep(*args, **kwargs):
+        raise RecursionError("nested too deeply")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(actuator_gate.json, "dumps", too_deep)
+        decision = gate.handle({"type": "record", "n": 1, "hash": leaf(nested), "record": nested})
+    assert (decision["accepted"], decision["reason"]) == (False, "the record is not in canonical form")
+    assert decision["send"] == SAFE and gate.state["n"] == 0
+    assert gate.handle(genuine)["send"] == {"speed_mm_s": 500}
+
+
+def test_a_record_refused_for_its_encoding_does_not_count_for_the_deadman(tmp_path):
+    """Only an accepted record holds the deadman off, and this one is not accepted."""
+    line = Line(str(tmp_path))
+    gate = Gate(line.state, SAFE, PUBLIC, 4)
+    gate.handle(line.record("genesis"), now=0.0)
+    gate.handle(line.command(500), now=1.0)
+    quiet = in_another_encoding(line.record("heartbeat"), SPACED)
+    assert gate.handle(quiet, now=4.0)["reason"] == "the record is not in canonical form"
+    assert gate.check_deadman(5.1)["why"] == "deadman"
+
+
+def test_the_gate_program_refuses_a_record_in_another_encoding_and_then_takes_the_genuine_one(tmp_path):
+    line = Line(str(tmp_path))
+    assert line.send(line.record("genesis"), line.command(500)).returncode == 0
+    genuine = line.command(700)
+    done = line.send(in_another_encoding(genuine, SPACED), genuine)
+    assert done.returncode == 2 and "REFUSED: the record is not in canonical form" in done.stdout
+    assert line.sent() == [("applied", 500), ("gate_refused", 0), ("applied", 700)]
+    with open(line.state, encoding="utf-8") as fh:
+        head = json.load(fh)
+    assert (head["n"], head["hash"]) == (2, genuine["hash"])
 
 
 def test_three_separate_copies_of_the_signature_check_agree_with_rfc_8032():

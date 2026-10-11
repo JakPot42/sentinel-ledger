@@ -4,10 +4,20 @@ Each case builds the recorder with one deliberate bug, runs the scenario that ex
 it, and requires a non-zero exit code from the check named, with the finding named. The
 same scenarios pass with the clean recorder in test_scenarios.py, so a red result here
 comes from the bug and nothing else.
+
+At the end is one planted bug in the gate that needs no robot: the gate without its check
+of a record's canonical form. The gate's other planted bugs need the simulated robot and
+are in test_ros2.py.
 """
+import json
+import os
+import subprocess
+import sys
+
 import pytest
 
 import run_scenarios
+from test_gate import SPACED, in_another_encoding
 
 # feature, scenario, the exit code that must turn red, the finding that must appear
 CASES = [
@@ -62,3 +72,89 @@ def test_the_gate_alone_does_not_bound_unrecorded_commands_to_one(planted, tmp_p
     assert observed["verifier_exit"] == 2 and observed["findings"] == ["GATE_HEAD_NOT_IN_JOURNAL"]
     assert observed["gate_exit_after_restart"] == 2
     assert ("applied", 400) not in observed["sent"]
+
+
+# --- a planted bug in the gate, on the file path -----------------------------------------
+
+def a_copy_in_another_encoding_arrives_first(recorder, out, gate_program):
+    """The recorder as shipped records four commands and stops. Before the gate runs, a
+    copy of the third command's message in another encoding is put on the link in front of
+    the genuine one, as a node with no key that got there first would put it. Then the
+    gate program given is run over the link, and the verifier over the journal. Returns
+    what was observed."""
+    w = run_scenarios.Workspace(str(out), "another_encoding_first", recorder)
+    ops = "".join(json.dumps(run_scenarios.command(speed)) + "\n" for speed in (200, 400, 600, 800))
+    recorded = subprocess.run(w.run_args("2026-10-01T08:00:00Z"), input=ops, capture_output=True, text=True)
+    root = [json.loads(text) for text in recorded.stdout.splitlines() if text.strip()][-1]["root"]
+    with open(w.link, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    messages = [json.loads(text) for text in lines]
+    third = [i for i, m in enumerate(messages) if json.loads(m["record"])["kind"] == "command"][2]
+    genuine = messages[third]
+    copy = in_another_encoding(genuine, SPACED)
+    with open(w.link, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("".join(text + "\n" for text in lines[:third] + [json.dumps(copy)] + lines[third:]))
+
+    gate = subprocess.run([sys.executable, gate_program, "--link", w.link, "--state", w.gate_state,
+                           "--actuator", w.actuator, "--safe-state", run_scenarios.SAFE_STATE,
+                           "--public-key", w.public_key], capture_output=True, text=True)
+    with open(w.gate_state, encoding="utf-8") as fh:
+        head = json.load(fh)
+    code, report = w.verify(root=root, witness=False)
+    return {"recorder_exit": recorded.returncode, "gate_exit": gate.returncode, "gate_said": gate.stdout,
+            "sent": w.sent(), "head": (head["n"], head["hash"]), "genuine": (genuine["n"], genuine["hash"]),
+            "copy": (copy["n"], copy["hash"]), "last_record": (messages[-1]["n"], messages[-1]["hash"]),
+            "verifier_exit": code, "findings": run_scenarios.kinds(report),
+            "commands": report.get("counts", {}).get("commands"),
+            "verifier_exit_without_the_gates_state": w.verify(root=root, witness=False, gate=False)[0]}
+
+
+AS_RECORDED = [("applied", 200), ("applied", 400), ("gate_refused", 0), ("applied", 600), ("applied", 800)]
+
+
+def test_a_copy_in_another_encoding_sent_first_is_refused_and_the_journal_still_verifies(recorder, tmp_path):
+    """The gate refuses the copy for its form and sends the safe state, as for any refusal.
+    Its head does not move, so the genuine record still follows it and is carried out, and
+    so is every record after it. The verifier, given the gate's state, finds the gate's
+    head in the journal and has no findings."""
+    seen = a_copy_in_another_encoding_arrives_first(recorder, tmp_path, run_scenarios.GATE)
+    assert seen["recorder_exit"] == 0
+    assert seen["gate_exit"] == 2 and seen["gate_said"].count("REFUSED") == 1
+    assert "REFUSED: the record is not in canonical form" in seen["gate_said"]
+    assert seen["sent"] == AS_RECORDED
+    assert seen["head"] == seen["last_record"]
+    assert (seen["verifier_exit"], seen["findings"], seen["commands"]) == (0, [], 4)
+
+
+def test_planted_bug_gate_does_not_check_a_records_canonical_form(recorder, tmp_path):
+    """The gate with its check of the canonical form removed, which is the gate as it was.
+    It checks the signature over a re-serialisation of the record, so the copy passes: the
+    command in it is carried out, and the gate's head becomes the hash of the copy's text,
+    which is in no journal. The genuine record, arriving second, is refused for its place
+    in the chain, and so is every record the recorder sends after it. The journal on its
+    own is clean. Beside the gate's state the verifier exits 2: a false alarm against an
+    honest recorder, raised by a node that holds no key.
+
+    Planted the same way as the gate's bugs in test_ros2.py: a copy of the gate with one
+    line changed, after proving the line was there to change. Here the copy is run as the
+    file demo's gate program, so no robot is needed."""
+    broken = tmp_path / "gate_without_the_form_check"
+    broken.mkdir()
+    with open(run_scenarios.GATE, encoding="utf-8") as fh:
+        source = fh.read()
+    check = "    if not in_canonical_form(raw, record):"
+    assert source.count(check) == 1
+    (broken / "actuator_gate.py").write_text(source.replace(check, "    if False:"), encoding="utf-8")
+
+    seen = a_copy_in_another_encoding_arrives_first(recorder, tmp_path / "broken",
+                                                    os.path.join(str(broken), "actuator_gate.py"))
+    assert seen["sent"] == [("applied", 200), ("applied", 400), ("applied", 600)] + [("gate_refused", 0)] * 3
+    assert seen["gate_exit"] == 2 and seen["gate_said"].count("REFUSED: does not extend the chain") == 3
+    assert seen["head"] == seen["copy"] and seen["head"] != seen["genuine"]
+    assert seen["verifier_exit_without_the_gates_state"] == 0
+    assert (seen["verifier_exit"], seen["findings"]) == (2, ["GATE_HEAD_NOT_IN_JOURNAL"])
+
+    # The same with the real gate, in the same test, so the difference is the one line.
+    seen = a_copy_in_another_encoding_arrives_first(recorder, tmp_path / "real", run_scenarios.GATE)
+    assert seen["sent"] == AS_RECORDED and seen["head"] == seen["last_record"]
+    assert (seen["verifier_exit"], seen["findings"]) == (0, [])

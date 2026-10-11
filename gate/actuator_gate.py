@@ -21,6 +21,9 @@ used two ways here:
 
 What it checks for each record message:
   - the hash it carries is SHA-256(0x00 || record text), LogChain's leaf hash;
+  - the record text is its own canonical form, byte for byte (docs/SPEC.md section 7.1),
+    as the verifier requires of every record in the journal. The same signed record in
+    any other encoding is refused: its hash would not be the one the journal holds;
   - the record is signed by the recorder: its `sig` is an Ed25519 signature, under the
     public key the gate was started with, of the record's other fields. The gate holds
     the public key only. It cannot sign;
@@ -205,9 +208,21 @@ def signature_ok(record, public_hex):
         return False
 
 
+def in_canonical_form(raw, record):
+    """True only if `raw` is, byte for byte, the canonical form (docs/SPEC.md section 7.1)
+    of `record`, the value parsed from it."""
+    try:
+        return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True) == raw
+    except RecursionError:
+        # Text can be parsed and still be nested too deeply to write out again. That is
+        # no record's canonical form, and it is a refusal, not an error in the gate.
+        return False
+
+
 def judge(message, state, public_key):
     """Returns (record or None, reason for refusal or None, the kind of reason or None).
-    The kind is `form` (not a well-formed record message), `signature` or `chain`."""
+    The kind is `form` (not a well-formed record message, or a record whose text is not
+    in canonical form), `signature` or `chain`."""
     raw, claimed = message.get("record"), message.get("hash")
     if not isinstance(raw, str) or not isinstance(claimed, str):
         return None, "the message carries no record", "form"
@@ -217,6 +232,15 @@ def judge(message, state, public_key):
         record = json.loads(raw)
     except ValueError:
         return None, "the record is not JSON", "form"
+    # The text must be the record's canonical form, byte for byte (docs/SPEC.md section
+    # 7.1), which is what the verifier requires of every record in the journal. The
+    # signature below is checked over a re-serialisation of the parsed record, so
+    # without this line a genuine record sent in another encoding (extra spaces, another
+    # key order, a key given twice) would pass it, and the gate's head would become a
+    # hash the journal does not hold. It comes before the signature check, with the other
+    # checks on the message's form, so a record wrong in both ways is refused for `form`.
+    if not in_canonical_form(raw, record):
+        return None, "the record is not in canonical form", "form"
     if not isinstance(record, dict) or type(record.get("n")) is not int:
         return None, "the record has no number", "form"
     if message.get("n") != record["n"]:

@@ -127,6 +127,9 @@ accepted. The recorder sends it every record, of every kind, as
 For each message the gate checks that:
 
 - the hash is `SHA-256(0x00 || record text)`;
+- the record text is its own canonical form (section 7.1), byte for byte: parsing the
+  text and writing it out again in canonical form MUST give the same bytes. The
+  verifier requires the same of every record in the journal (section 8);
 - the record is signed by the recorder (section 7.6). The gate holds the recorder's
   public key and nothing that could sign a record;
 - the record's `n` is one more than the last accepted, and its `prev` is the last accepted
@@ -153,6 +156,22 @@ record, a replayed command, a record out of order, a record from a different jou
 record whose text was changed, and a record built by someone else to follow the chain are
 all refused. A recorder that drops, skips or loses a record cannot continue: its next
 record does not follow the gate's head, so the gate refuses it and everything after it.
+
+**Why the text must be canonical.** A signature covers the canonical form of the parsed
+record, not the bytes that arrived. The same signed record can be written in other bytes
+without touching the signature: with spaces, with its keys in another order, with a key
+given twice, with a trailing newline. Each of those has a different leaf hash. A gate
+that checked only the signature would accept such a copy, carry out its command, and
+hold as its head a hash the journal does not contain. The recorder's own record, arriving
+after the copy, would then be refused for its place in the chain, and the verifier,
+given the gate's state, would report `GATE_HEAD_NOT_IN_JOURNAL` against a recorder that
+did nothing wrong. No key is needed to do this. Until 10 October 2026 the gate had this
+gap, while the verifier already reported such text as `RECORD_MALFORMED`. The gate now
+refuses it with the reason `form`, before it looks at the signature, so that a record
+wrong in both ways gets one predictable reason. A copy that changes a number's type
+(`0` written as `0.0`) passes this test, since `0.0` is written out again as `0.0`. It is
+refused one step later, for its signature: the signed text has the integer. A refused
+copy still costs a safe-state action, like every refusal.
 
 **What this cannot enforce.** A signature shows the record was made by someone holding the
 private key. Anyone who can read the recorder's key file can make records the gate
@@ -288,7 +307,8 @@ So the gate answers. When it is given a signing key of its own, it signs a recei
 - for every message it refuses: `refused`, with the reason `signature` (not signed by the
   recorder), `chain` (not the record after the gate's head, or a first record that is
   not a genesis record) or `form` (not a well-formed record message: no record in it, a
-  hash that is not the record's, text that is not JSON, a command with no usable action);
+  hash that is not the record's, text that is not JSON, record text that is not in
+  canonical form, a command with no usable action);
 - for every deadman trip (section 4.3): `deadman`.
 
 Those four reasons are the four checks the gate makes. The gate checks no speed or range
@@ -924,7 +944,9 @@ writes ignored, heartbeats not written) and confirms a check exits non-zero for 
 bug is a Cargo feature that is off by default. The table of planted bugs and which check
 caught each is in the README. The gate's planted bugs (no signature check, no deadman, no
 age check, receipts for refusals dropped, no receipts) are made by handing the robot a
-copy of the gate with one line changed.
+copy of the gate with one line changed. A sixth, no check of a record's canonical form
+(section 4.2), is made the same way and run as the file demo's gate program, with no
+robot.
 
 The recorder that forwards before it records is the instructive one. Its journal is a
 clean journal: the verifier given the journal alone finds nothing. It is caught by the
@@ -1383,6 +1405,9 @@ rules check out, and the verifier exits 2 with `GATE_REFUSED`: the journal holds
 gate's receipt for each refusal, with the reason in the third column as `form` (no
 record, the hash), `chain` or `signature`. Before receipts the verifier exited 0 on these
 journals and nothing in them said another node had tried.
+
+A genuine record sent in another encoding is refused for `form` as well (section 4.2).
+That is tested with the gate on its own and on the file path, not in a ROS scenario.
 
 Before records were signed, the forged record of scenario 7 was accepted and moved the
 robot at 1500 mm/s. A test keeps that visible: it hands the robot a copy of the gate with

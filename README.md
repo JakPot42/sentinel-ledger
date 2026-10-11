@@ -35,13 +35,14 @@ assistant; I reviewed the specification, the results and this README.
 For every command, in this order: take the command the controller requested, get the
 command the safety layer applied and the rules that acted, write one record, flush it to
 disk, and only then send the record to a gate on the actuator's side. The gate passes the
-command on only if the record is signed by the recorder and extends the chain of records
-it has already seen. In the ROS 2 version the gate also has a deadman (no valid record
-for a configured time means the safe state) and a limit on a command's age (a command
-that reaches it too long after the recorder received it is not carried out). And the gate
-answers: for every command record, and for every message it refuses, it signs a receipt
-saying what it did, with a key of its own, and the recorder writes that receipt into the
-journal. A command the gate refused is in the journal as refused, with the reason.
+command on only if the record is signed by the recorder, is written in its one canonical
+form, and extends the chain of records it has already seen. In the ROS 2 version the gate
+also has a deadman (no valid record for a configured time means the safe state) and a
+limit on a command's age (a command that reaches it too long after the recorder received
+it is not carried out). And the gate answers: for every command record, and for every
+message it refuses, it signs a receipt saying what it did, with a key of its own, and the
+recorder writes that receipt into the journal. A command the gate refused is in the
+journal as refused, with the reason.
 
 Each record holds:
 
@@ -302,6 +303,24 @@ In the last two rows the unrecorded commands do reach the actuator: one in the f
 two in the second. The gate does not prevent them. It makes them visible and stops the
 recorder carrying on after a restart.
 
+One more planted bug on the file path is in the gate, not the recorder. The gate is
+Python, so the test runs a copy of the gate program with one line changed, after proving
+the line was there to change (`tests/test_planted_bugs.py`).
+
+| planted bug | how it is exercised | what turns red |
+|---|---|---|
+| the gate does not check that a record's text is in canonical form | the recorder as shipped records four commands. A copy of the third command's record with spaces added, carrying the hash of that text, is put in front of the genuine one, as a node with no key could put it | the copy is accepted and its command carried out. The gate's head becomes a hash that is in no journal, so the genuine record and every record after it are refused. The verifier with the gate's state exits 2 (`GATE_HEAD_NOT_IN_JOURNAL`) on a journal that is clean without it. This is what the gate did before it had the check: it was laxer than the verifier, which already required the canonical form |
+
+With the check, the copy is refused for `form`, the genuine record and the ones after it
+are carried out, and the verifier exits 0. A refusal still sends the safe state, as every
+refusal does, so a node that sends such copies can stop the machine. It can no longer
+leave the gate holding a hash that the journal does not hold. `tests/test_gate.py`
+covers ten ways of writing the same record in other bytes: added spaces, another key
+order, several lines, a key given twice (two ways), a trailing newline, trailing spaces,
+a leading space, zero written as -0, and a letter written as an escape. One more, a whole
+number written as a decimal, passes the check of the form and is refused one step later,
+for its signature.
+
 ## ROS 2
 
 The same recorder as a ROS 2 node, with a simulated robot. `ros2 launch` starts the two
@@ -345,13 +364,14 @@ in the robot's own log.
 
 Now the gate signs a receipt for every command record it takes in (`applied`, `blocked`,
 or `refused` for `age`), for every message it refuses (`refused` for `signature`, `chain`
-or `form`, meaning not a well-formed record message), and for every deadman trip. It
-signs with a key of its own, whose public half is `gate_public_key` in the machine's
-configuration. The robot publishes each receipt on `gate_receipts`. The recorder checks
-that the gate signed it and that it is newer than the last one, and writes it into the
-journal as a record of its own, signed and chained like the rest. The gate acts first and
-signs afterwards, so a stop is not delayed by the signature on its own receipt. It can
-still wait behind other signature work in the same thread: see "Time spent in the gate".
+or `form`, meaning not a well-formed record message, or a record whose text is not in
+canonical form), and for every deadman trip. It signs with a key of its own, whose public
+half is `gate_public_key` in the machine's configuration. The robot publishes each
+receipt on `gate_receipts`. The recorder checks that the gate signed it and that it is
+newer than the last one, and writes it into the journal as a record of its own, signed
+and chained like the rest. The gate acts first and signs afterwards, so a stop is not
+delayed by the signature on its own receipt. It can still wait behind other signature
+work in the same thread: see "Time spent in the gate".
 
 Those four reasons are the four checks the gate makes. It has no speed limit of its own:
 limits are the ruleset's, applied before the record is written and recomputed by the
@@ -402,7 +422,8 @@ someone who holds the recorder's key and not the gate's rewrites a refusal as `a
 
 Eight planted bugs on the ROS path. Three are Cargo features of the node. The other five
 are in the gate, which is Python: the test hands the robot a copy of the gate with one
-line changed.
+line changed. A sixth planted bug in the gate, the check of a record's canonical form
+removed, needs no robot and is listed under "Planted bugs" above.
 
 | planted bug | scenario | what turns red |
 |---|---|---|
@@ -551,7 +572,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 143 tests
+python3 -m pytest tests            # with ROS sourced: 160 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
@@ -602,7 +623,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 119 tests without ROS 2 (24 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 136 tests without ROS 2 (24 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
