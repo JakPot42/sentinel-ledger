@@ -1,14 +1,31 @@
 # Sentinel Ledger
 
-Sentinel Ledger is a recorder that sits in a machine's command path: a command reaches the
-actuator only inside a record of it, so the record of what was commanded is complete by
-construction and does not rest on trusting the operator to log. The journal is
-tamper-evident, and its roots are anchored outside the operator's control, with a witness
-that stores them or an RFC 3161 timestamp.
+Sentinel Ledger is a recorder designed to sit in a machine's command path. It writes a
+signed record of each command, waits for the disk to confirm it, and only then sends the
+record on. A gate on the actuator's side passes a command to the actuator only if it
+arrives inside a record the recorder signed and that follows the last record the gate
+accepted. The journal is tamper-evident, and its roots can be anchored outside the
+operator's control, with a witness that stores them or an RFC 3161 timestamp.
 
-Both sentences have limits, and they are stated below before anything else is claimed.
-This is a first build on a simulated machine. It is not certified, it is not a safety
-system, and it cannot see anything that does not pass through it.
+That is the design. What exists is a first build on a simulated machine, and in this
+build:
+
+- the file demo's gate is not in line. It reads the recorder's messages from a file after
+  they are written. In the ROS 2 version the gate is inside a simulated robot whose only
+  command input goes through it;
+- the witness is a local process on the same machine, and the timestamp path was tested
+  with a throwaway authority made by openssl. FreeTSA has not been called. No root in any
+  run here was held outside the operator's control;
+- the ROS 2 scenarios use no witness and no timestamps.
+
+The record of what was commanded is complete by construction, without trusting the
+operator to log, only under two conditions: the gate is in line, and the actuator has no
+other input. Neither has been shown on a real machine. Even then the gate cannot see
+whether a record reached the disk. That is checked afterwards, and it is the first limit
+below.
+
+It is not certified, it is not a safety system, and it cannot see anything that does not
+pass through it. The limits are listed below, before any result is reported.
 
 I designed Sentinel Ledger and directed its build. The code was written with an AI coding
 assistant; I reviewed the specification, the results and this README.
@@ -96,6 +113,15 @@ Read these before relying on anything above.
   stops a node or a person without the key. It does not stop the operator, or anything
   running as the recorder's user. The key is an ordinary file. Key rotation and hardware
   key storage are out of scope. On Windows the recorder does not check who can read it.
+- **The gate's and the verifier's Ed25519 is written here, in plain Python.** It is not a
+  reviewed library. The tests check it against two test vectors from RFC 8032 (section
+  7.1, tests 1 and 2) and altered copies of those two, and against nothing else. It is
+  not constant time: the gate signs its receipts with it, and nothing hides the gate's
+  key from someone who can time those signatures. The recorder signs with the
+  `ed25519-dalek` library.
+- **Without the machine's public key, a journal re-signed with any key verifies.** The
+  verifier then takes the key from the journal's first record. See "Tampering, and what
+  anchoring changes" below.
 - **A rewrite by someone who holds the key verifies if nothing outside is consulted.**
   Rewrite a record, sign it again, repair every hash, the root and the local anchor
   statements, and the journal has no findings, unless the verifier is given a root, a
@@ -150,12 +176,38 @@ What it does not cover:
 - **Receipts double the writes.** A command is now two records and two flushes to disk.
   Every message the gate refuses costs it a signature and the journal a record, and
   nothing limits how fast another node can cause them.
+- **The gate's signature work runs in the robot's one thread.** On an idle machine it
+  takes about 4 ms to check a record's signature and about 4 ms to sign a receipt, and
+  about three times that with every processor busy. The deadman check and the motion
+  step wait while it runs. No delay from command in to actuator out has been measured,
+  and no maximum command rate has been tested. The figures are in "Time spent in the
+  gate".
 - **The file demo has no receipts.** Its configuration names no gate key, and nothing
   carries a receipt back while that recorder runs.
 - **The deadman is only as good as the robot's own timer.** The simulated robot is one
   thread and checks twenty times a second. Anything slow on the robot's side delays the
   check. In a real controller the deadman belongs on a timer of its own. The file demo's
   gate reads a file after the fact and has no deadman.
+- **The deadman watches the recorder, not the controller.** It trips when the gate has
+  accepted no record for `gate_deadman_seconds`, and heartbeat records count. If the
+  controller dies or hangs while the recorder keeps writing heartbeats, the robot keeps
+  its last commanded velocity with no time limit. Nothing here times out a command that
+  is not renewed. An ordinary ROS 2 base controller does: the diff drive controller of
+  ros2_control stops when no command has arrived for `cmd_vel_timeout`, half a second by
+  default. The behaviour is in `Gate.handle` and `Gate.check_deadman` in
+  `gate/actuator_gate.py` and is pinned by
+  `test_heartbeat_records_keep_the_last_command_in_force` in `tests/test_deadman.py`.
+- **Every stop ends by itself.** After a deadman trip, a command refused for its age, a
+  blocked command or a refused message, the next accepted command moves the robot again.
+  Nothing latches the stop and there is no deliberate reset. For the deadman that is
+  pinned by `test_after_a_trip_the_next_accepted_command_moves_the_robot_again_and_rearms_it`
+  in `tests/test_deadman.py`. Machinery practice expects a deliberate reset before a
+  machine restarts after a protective stop. Annex III, 1.2.3 of the regulation profiled
+  below requires "voluntary actuation of a control device provided for the purpose" to
+  start, and says "The same requirement applies" when "restarting the machinery or
+  related product after a stoppage, whatever the cause", with an exception for automatic
+  mode where that "does not lead to a hazardous situation". This build has no such
+  device and makes no such assessment, and the profile does not map 1.2.3.
 - **The pass/fail runs keep the journal in RAM.** That is for tests only. See "When the
   disk is slow".
 - **Safety inputs are not checked for age or origin.** The last `safety_inputs` message
@@ -192,16 +244,30 @@ Scenario 5's failure is a real failed write: the journal file is made read-only 
 outcome, then repairs every hash, the root, the state file and the anchor statements kept
 beside the journal.
 
-A forger without the recorder's key is caught with nothing from outside at all:
+A forger without the recorder's key is caught when the verifier is given the machine's
+public key. In each row below the verifier was given the forger's own root and the public
+key from the machine's configuration (`--public-key`), and no witness's store, gate state
+or timestamp. Every scenario and every tamper test here passes that key.
 
 | the forger | what the verifier is given | exit | finding |
 |---|---|---|---|
-| leaves the old signatures on the changed records | only the forger's own root | 2 | `SIGNATURE_INVALID` |
-| removes a signature | only the forger's own root | 2 | `SIGNATURE_MISSING` |
-| re-signs the whole journal with a key of their own | the machine's public key | 2 | `KEY_MISMATCH` |
+| leaves the old signatures on the changed records | the forger's own root and the machine's public key | 2 | `SIGNATURE_INVALID` |
+| removes a signature | the forger's own root and the machine's public key | 2 | `SIGNATURE_MISSING`, and `SIGNATURE_INVALID` for the records after it |
+| re-signs the whole journal with a key of their own and writes that key into the first record | the forger's own root and the machine's public key | 2 | `KEY_MISMATCH` |
+
+The public key is something from outside the journal, and the third row depends on it.
+Without `--public-key` the verifier takes the key from the journal's first record, so a
+journal re-signed from end to end with a forger's key, with that key written into the
+first record, verifies clean: exit 0, no findings. That was run by hand on 10 October
+2026 and is not a test in the suite. In the same run the first two rows gave the same
+findings without the key. That is no protection: a forger with no key can do what the
+third row does. So the public key has to reach the verifier from somewhere the journal's
+keeper cannot write.
 
 A forger who holds the key, as the operator does, signs the rewritten records again.
-Then it depends on what the verifier is given:
+The verifier is given the machine's public key in these rows too, and it changes
+nothing, because the forger signs with that key. Then it depends on what else the
+verifier is given:
 
 | what the verifier is given | exit | finding |
 |---|---|---|
@@ -284,7 +350,8 @@ signs with a key of its own, whose public half is `gate_public_key` in the machi
 configuration. The robot publishes each receipt on `gate_receipts`. The recorder checks
 that the gate signed it and that it is newer than the last one, and writes it into the
 journal as a record of its own, signed and chained like the rest. The gate acts first and
-signs afterwards, so a stop is not delayed by a signature.
+signs afterwards, so a stop is not delayed by the signature on its own receipt. It can
+still wait behind other signature work in the same thread: see "Time spent in the gate".
 
 Those four reasons are the four checks the gate makes. It has no speed limit of its own:
 limits are the ruleset's, applied before the record is written and recomputed by the
@@ -348,6 +415,41 @@ line changed.
 | the gate drops the receipt for every refusal | 11, 7 | the robot behaves exactly as it should, and the verifier exits 2. Scenario 11: `COMMAND_WITHOUT_RECEIPT` for the command refused for its age, and `RECEIPT_MISSING` for the skipped number. Scenario 7: `RECEIPT_MISSING` only, since the forged record was never one of the recorder's commands |
 | the gate signs no receipts | 3 | the verifier exits 2: `COMMAND_WITHOUT_RECEIPT` for every command. This is the gate as it was before receipts |
 
+### Time spent in the gate
+
+The gate checks the signature on every record and signs every receipt with Ed25519
+written in plain Python (`gate/actuator_gate.py`). Timed on one machine on 10 October
+2026 with nothing else running: 300 calls of each of the gate's own two functions, on a
+933-byte command record and a 331-byte receipt shaped like the ROS node's. Mean, then
+the fastest and slowest single call:
+
+| | Windows 11, CPython 3.14.2 | Ubuntu 26.04 under WSL 2, CPython 3.14.4 |
+|---|---|---|
+| check one signature (`ed25519_verify`) | 4.4 ms, 4.1 to 5.0 | 4.1 ms, 3.7 to 5.4 |
+| sign one receipt (`ed25519_sign`) | 3.9 ms, 3.7 to 6.6 | 3.8 ms, 3.3 to 8.2 |
+
+A second run of each gave means within 4 percent of these. With every processor kept
+busy by eight spinning processes (Windows, 100 calls each) the means were 12.2 ms to
+check and 11.2 ms to sign, and the slowest single calls took 39 ms and 36 ms. A machine
+that is busy or throttled will be slower than the table.
+
+Both functions run in the simulated robot's one thread, the same thread as the deadman
+check and the motion step, which are due twenty times a second. What follows is worked
+out from the figures above. It is not a measured delay from command in to actuator out,
+and no maximum command rate has been tested.
+
+- A command waits for one signature check at the gate before the robot acts on it: about
+  4 ms on an idle machine, on top of the recorder's wait for the disk.
+- With receipts, one command costs the gate two checks and one signature, about 12 to
+  13 ms of that thread: the command record, the receipt for it, and the recorder's record
+  of that receipt, which the gate checks like any other record. From that alone the gate
+  cannot take more than about 80 commands a second on an idle machine, or about 26 with
+  every processor busy. The gate also writes its state file after every message, and
+  that time is not in these figures.
+- While the gate is checking or signing, the deadman check and the motion step wait. On
+  an idle machine one command's work is shorter than one 50 ms step. With every
+  processor busy, single calls took most of a step.
+
 ### When the disk is slow
 
 The recorder writes a record and waits for the disk to confirm it before it forwards the
@@ -369,14 +471,19 @@ What happens now when a write takes longer than twice the heartbeat interval (4 
 in the demo):
 
 - **The robot stops.** The gate has a deadman: no valid record for
-  `gate_deadman_seconds` (4 in the demo) means the safe state. Heartbeat records count,
-  so a quiet recorder that is alive keeps the last command in force. Before this, the
-  robot carried on at its last commanded velocity for as long as the recorder was silent.
-- **The robot stays stopped.** When the slow write completes, the command in it is late.
-  Every command record carries the time the recorder received it. The gate refuses to
-  carry out a command more than `gate_max_command_age_ms` old (1 second in the demo) and
-  keeps the safe state. The record still counts as the next in the chain, so the
-  recorder's later commands are accepted as usual.
+  `gate_deadman_seconds` (4 in the demo) means the safe state. Before this, the robot
+  carried on at its last commanded velocity for as long as the recorder was silent.
+  Heartbeat records count, so a quiet recorder that is alive keeps the last command in
+  force for as long as its heartbeats arrive. That is a limit and not a safeguard: the
+  deadman covers a recorder that has gone silent, not a controller that has stopped
+  sending commands (see the limits of the ROS 2 version).
+- **The robot stays stopped until the next accepted command.** When the slow write
+  completes, the command in it is late. Every command record carries the time the
+  recorder received it. The gate refuses to carry out a command more than
+  `gate_max_command_age_ms` old (1 second in the demo) and keeps the safe state. The
+  record still counts as the next in the chain, so the recorder's later commands are
+  accepted as usual, and the first of them moves the robot again. Nothing latches the
+  stop.
 - **The journal says the command was not carried out.** The gate's receipt for that
   record says `refused`, reason `age`, and the verifier reports `GATE_REFUSED`. Its
   receipt for the deadman trip is there too (`GATE_DEADMAN`). Both were issued during the

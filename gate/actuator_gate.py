@@ -58,8 +58,9 @@ What it does:
     numbered from 0 with no gaps. The recorder writes each one into the journal as a
     record, and the verifier reports every refusal, every deadman trip, every command
     with no receipt and every gap in the numbering. The gate signs after it has acted, so
-    signing delays no stop. The gate's key is not the recorder's: the gate still holds
-    only the public half of the recorder's key and cannot make a record.
+    signing a receipt does not delay the stop that receipt is about. The gate's key is
+    not the recorder's: the gate still holds only the public half of the recorder's key
+    and cannot make a record.
 
 What it cannot check: that the record it was shown was ever written to the journal. It
 keeps its head (state file) so that can be compared with the journal afterwards. And a
@@ -165,8 +166,11 @@ def ed25519_public(gate_key):
 
 
 def ed25519_sign(gate_key, message):
-    """An Ed25519 signature of `message`, 64 bytes. Plain Python: it takes a few
-    milliseconds and is not written to hide the key from someone who can time it."""
+    """An Ed25519 signature of `message`, 64 bytes. Plain Python and not constant time: it
+    is not written to hide the key from someone who can time it. Measured on one machine
+    at about 4 ms a call when the machine is idle and about 11 ms with every processor
+    busy (README, "Time spent in the gate"). It runs in the caller's thread, so whatever
+    else that thread does waits for it."""
     scalar, prefix = _expand(gate_key)
     public = _point_to_bytes(_point_mul(scalar, _BASE))
     r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % _L

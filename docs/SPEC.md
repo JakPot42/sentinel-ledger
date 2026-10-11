@@ -216,6 +216,13 @@ the actuator stays there until the next accepted command.
 - **Before the first record** the gate has passed nothing on, and the deadman does not
   run.
 - **What it is not.** It does not judge a command's age. That is section 4.4.
+- **What it does not watch.** The controller. Heartbeat records hold the deadman off, so
+  if the controller dies or hangs while the recorder is alive, the actuator keeps its
+  last command with no time limit. A timeout on a command that is not renewed is not
+  built.
+- **No latch.** After a trip, the next accepted command moves the actuator again. The
+  same holds after a command refused for its age (section 4.4), a blocked command and a
+  refused message. A stop that holds until someone deliberately resets it is not built.
 
 The setting is in the genesis record's `settings` when the machine has one, and the
 configuration file is hashed into the state in force, so every record names it.
@@ -324,8 +331,8 @@ verifier expects none. Changing the key is not supported, as for the recorder's
 (section 7.6).
 
 **Order on the gate's side.** The gate acts first, then signs, then saves its state with
-the next receipt number in it, then sends the receipt. Signing delays no stop, and a
-number is not used twice.
+the next receipt number in it, then sends the receipt. Signing a receipt does not delay
+the stop that receipt is about, and a number is not used twice.
 
 **The recorder** writes each receipt into the journal as a record of kind `gate_receipt`
 (section 7.2), holding the receipt whole, signature included. Before it writes, it checks
@@ -388,8 +395,12 @@ numbering. Both are tests.
 - **Nothing limits the rate.** Every message the gate refuses costs it a signature and
   costs the recorder a record. A node that floods the gate's input fills the journal.
 - **Cost.** A command is now two records and two flushes to disk: the command, and the
-  receipt for it. The gate's signature is made in plain Python, takes a few milliseconds
-  and is not written to hide the key from someone who can time it.
+  receipt for it. The gate's signature is made in plain Python and is not written to
+  hide the key from someone who can time it. Measured on one machine, it takes about
+  4 ms when the machine is idle and about 11 ms with every processor busy, and checking
+  a record's signature takes about the same. Both run in the simulated robot's one
+  thread, and the deadman check waits while they do. The figures and what follows from
+  them are in the README under "Time spent in the gate".
 - **The file demo does not use it.** The gate program can sign receipts and append them
   to a file (`--gate-key`, `--receipts`), and the command-line recorder takes one with the
   operation `gate_receipt`. The five file scenarios do neither: their configuration names
@@ -771,8 +782,13 @@ Every record is signed with Ed25519 (RFC 8032).
 What a signature does and does not add:
 
 - A node or a person without the key cannot make a record the gate accepts, and cannot
-  rewrite a journal without the verifier seeing it, even when the verifier is given
-  nothing from outside the journal's directory.
+  rewrite a journal without the verifier seeing it, when the verifier is given the
+  machine's public key.
+- **Without `--public-key` the signature checks say nothing about whose key it is.** The
+  verifier then takes the key from the first record. A journal re-signed throughout with
+  another key, with that key written into the first record, verifies with no findings.
+  The public key has to reach the verifier from somewhere the journal's keeper cannot
+  write.
 - **Anyone who can read the private key file can forge.** That includes the operator, and
   anything running as the recorder's user. Signatures do not make the journal evidence
   against the operator. Anchoring (section 7.5) and the gate's head are what do that.
@@ -782,9 +798,10 @@ What a signature does and does not add:
   it cannot be copied is out of scope.
 - The recorder signs with the `ed25519-dalek` library, and checks the gate's receipts
   with it. The gate and the verifier each carry their own verification code in plain
-  Python, checked against the RFC's test vectors. It takes about 4 ms a signature, so a
-  long journal verifies slowly. The gate's signing code is plain Python too, checked
-  against the same vectors.
+  Python, checked against two of the RFC's test vectors (section 7.1, tests 1 and 2) and
+  no others. It takes about 4 ms a signature on an idle machine, so a long journal
+  verifies slowly. The gate's signing code is plain Python too, checked against the same
+  two vectors, and is not constant time.
 
 ## 8. The verifier
 
@@ -879,8 +896,9 @@ as asof-gate does, so the same inputs always give the same output.
   same for every record an anchor covers, **if** the keeper cannot reach the witness.
 - With the gate's state, that the last record the actuator's side accepted is in the
   journal.
-- That every record was signed by a holder of the recorder's private key. With
-  `--public-key`, that the key is the machine's.
+- That every record was signed by a holder of the private key matching the public key
+  the first record names. Only with `--public-key` is that the machine's key. Without
+  it, it is whatever key the journal names (section 7.6).
 - Where the settings name a gate key: that for every command record a holder of the
   gate's private key signed a statement of what the gate did with it, and which of
   those statements were refusals. With `--gate-public-key`, that the key is the machine's.
@@ -1211,6 +1229,10 @@ chained record was accepted:
   separate machines it needs synchronized clocks, which are not built (section 4.4).
 - **The deadman exists only where the gate has a clock.** The simulated robot has one.
   The file demo's gate does not.
+- **The deadman watches the recorder, not the controller, and no stop latches.** A
+  controller that stops commanding while the recorder heartbeats leaves the last command
+  in force with no time limit, and after any stop the next accepted command moves the
+  actuator again (section 4.3).
 - **Gate receipts are the gate's own statement, sent once.** One that does not reach the
   journal is reported as missing, not recovered. Both keys are files on one machine in
   the demo. The file scenarios do not use receipts at all (section 4.5).
