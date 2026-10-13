@@ -667,3 +667,8 @@ recorder, and tests check their import lists.
 MIT, see `LICENSE`. The two files in `sources/eu/` are European Union documents
 (© European Union), included unchanged so the quotations can be checked; only the version
 published in the Official Journal is authentic.
+
+The recorder is built on [LogChain](https://github.com/JakPot42/logchain), which Cargo
+fetches from GitHub at a pinned revision, and on Rust crates from crates.io. The ROS 2 node
+also needs ROS 2, installed separately. None of these is included here, and none is covered
+by this licence.
