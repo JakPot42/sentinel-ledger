@@ -5,3 +5,5 @@ demo/installed/** -text
 demo/changes/** -text
 ros2/installed/** -text
 ros2/changes/** -text
+
+sources/** linguist-vendored
