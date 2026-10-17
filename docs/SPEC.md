@@ -1147,8 +1147,9 @@ verifier MUST NOT print "compliant", "conforms" or "meets the regulation".
 3. **The 2022 ethical black box draft standard.** Alan F. T. Winfield, Anouk van Maris,
    Pericle Salvini and Marina Jirotka, "An Ethical Black Box for Social Robots: a draft Open
    Standard", arXiv:2205.06564, submitted 13 May 2022. Title, authors and date confirmed
-   against the arXiv record on 2026-10-08. The paper itself has not been read for this
-   draft. A profile would map what it says a robot should log onto `decision` contents.
+   against the arXiv record on 2026-10-08. The paper was read on 16 October 2026, in its
+   first arXiv version (v1), then the latest there; it gives the standard as Draft 0.1. A
+   profile would map what it says a robot should log onto `decision` contents.
 
 ## 11. What this is not
 
@@ -1232,7 +1233,8 @@ chained record was accepted:
   make. The profile is unchanged until then.
 - California Vehicle Code 38750(c)(1)(G) was read on a republication, not on the
   Legislature's site (section 10.5).
-- The Winfield et al. paper was confirmed to exist as cited. Its contents were not read.
+- The Winfield et al. paper was read on 16 October 2026 (arXiv v1, which gives the
+  standard as Draft 0.1). Whether a later draft exists outside arXiv was not checked.
 - No harmonised standard for these Annex III provisions was looked for. If one exists it may
   say what "tracing log" must contain, and the profile would follow it.
 - That a successful flush means the record survives power loss. The recorder asks the
