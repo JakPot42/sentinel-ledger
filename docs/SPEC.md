@@ -98,8 +98,8 @@ produce a command with no record, which is the one failure this tool exists to r
 
 A recorder that blocks commands when it cannot write could block a stop command. That is
 not acceptable for a machine, and the regulation in section 10 says so directly (Annex III,
-1.2.1: "the machinery or related product shall not be prevented from stopping if the stop
-command has already been given").
+1.2.1, fourth paragraph, point (d): "the machinery or related product shall not be
+prevented from stopping if the stop command has already been given").
 
 So:
 
@@ -1004,6 +1004,14 @@ Publications Office (`publications.europa.eu/resource/celex/32023R1230R(01)`), k
 `8ccfcc43b3a86d102bc711d4f2c14d3be44ae2c2d8cb3e32e44d2bb933f44bf8`. Its 14 items change
 dates in Articles 6, 47 and 50 to 54. None changes Annex III.
 
+Amendments were checked on 2026-10-16 against the Publications Office's index for this
+Regulation. It has been amended by Regulation (EU) 2024/2748 and by Regulation (EU)
+2026/1744 (OJ L, 2026/1744, 24.7.2026). Neither changes the text of 1.1.9 or 1.2.1: the
+consolidated text of 27 July 2026 (`02023R1230-20260727`) gives both word for word as the
+file above does. The index also lists three more corrigenda, R(02) to R(04), in Dutch, in
+German and Slovak, and in Swedish; none has an English version. What 2026/1744 asks of
+Annex III in future is in section 13.
+
 All three provisions are in Annex III, Part B. The quotes are verbatim from the first file,
 and `tests/test_profile.py` fails if any quotation in the profile is not found in it word
 for word. The profile is `profiles/eu_2023_1230_annex_iii.json`.
@@ -1041,7 +1049,13 @@ paragraph, point (f).**
 - Records: `intervention_declared`, `intervention_detected`, `genesis`, and the `in_force`
   field of every command, which ties each command to a software version.
 - Retention: five years, counted from the `at` of each intervention record that changes a
-  software version.
+  software version. The regulation counts from the upload ("enabled for five years after
+  such upload"), and the profile takes the record's `at` as the time of the upload. For a
+  declared change the record is written just before the file is installed, so the two
+  differ by the time the install takes; only an install that runs past midnight would be
+  counted from the day before. For a change found by measurement (`intervention_detected`),
+  `at` is when the recorder noticed it, which can be later than the upload, so the period
+  counted here ends no earlier than the one the regulation sets.
 - Reading: "enabled for five years after such upload" is read as: the records about an
   upload must still be present and verifiable five years after it.
 
@@ -1058,7 +1072,11 @@ designed and constructed in such a way that:"
 > request from a competent national authority;
 
 - Records: command records with `decision_sha256`, and the decision files they name.
-- Retention: one year, counted from the command record's `at`.
+- Retention: one year, counted from the command record's `at`. The regulation counts from
+  collection ("retained for one year after its collection"), and the profile takes the
+  command record's `at` as the collection time. The decision data reaches the recorder
+  with the command, so it was collected at or before `at`, and the period counted here
+  ends no earlier than the one the regulation sets.
 - Reading: the decision file is the "data on the safety related decision-making process".
   What goes in it is the integrator's choice (section 6.4).
 
@@ -1202,8 +1220,16 @@ chained record was accepted:
 
 ## 13. Not verified
 
-- Whether Regulation (EU) 2023/1230 has been amended since the corrigendum of 4 July 2023
-  was not checked.
+- **What Annex III will add for AI.** Regulation (EU) 2026/1744 (the "Digital Omnibus on
+  AI"), Article 3, adds to Article 8 of Regulation (EU) 2023/1230: "The Commission shall
+  adopt delegated acts in accordance with Article 47 of this Regulation to amend Annex III
+  to this Regulation by adding health and safety requirements in respect of Artificial
+  Intelligence (AI) systems that are classified as high-risk pursuant to Article 6(1) of
+  Regulation (EU) 2024/1689 ..." and "Those delegated acts shall apply by 2 August 2028."
+  On 2026-10-16 the Publications Office's index listed no amending act other than
+  2024/2748 and 2026/1744, so none had been published in the Official Journal. When one
+  is, the profile has to be read against it: it may ask for records this build does not
+  make. The profile is unchanged until then.
 - California Vehicle Code 38750(c)(1)(G) was read on a republication, not on the
   Legislature's site (section 10.5).
 - The Winfield et al. paper was confirmed to exist as cited. Its contents were not read.
