@@ -123,6 +123,10 @@ fn run(dir: &Path, installed: &Path, key: &Path, link: &Path, start_at: Option<S
             Some("gate_receipt") => recorder
                 .gate_receipt(op.get("receipt").unwrap_or(&Value::Null))
                 .map(|(n, seq)| json!({"ok": true, "n": n, "seq": seq})),
+            // The actuator's feedback for a command, signed with the feedback key (section 4.6).
+            Some("actuator_feedback") => recorder
+                .actuator_feedback(op.get("feedback").unwrap_or(&Value::Null))
+                .map(|(n, seq)| json!({"ok": true, "n": n, "seq": seq})),
             Some("tick") => recorder
                 .tick(op.get("seconds").and_then(Value::as_i64).unwrap_or(0))
                 .map(|written| json!({"ok": true, "heartbeats": written})),

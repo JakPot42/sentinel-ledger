@@ -30,6 +30,7 @@ use crate::state::{Component, Config, State, sha256_hex};
 pub const SCHEMA: &str = "sentinel-ledger/record/0";
 pub const ANCHOR_SCHEMA: &str = "sentinel-ledger/anchor/0";
 pub const GATE_RECEIPT_SCHEMA: &str = "sentinel-ledger/gate-receipt/0";
+pub const FEEDBACK_SCHEMA: &str = "sentinel-ledger/actuator-feedback/0";
 const AT_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
 /// Why an operation did not complete.
@@ -120,6 +121,11 @@ pub struct Recorder {
     /// Command records forwarded by this process for which no receipt has come back yet.
     /// Only kept when the configuration names a gate key.
     awaiting_receipt: BTreeSet<usize>,
+    /// The number of the last actuator feedback written to the journal.
+    last_feedback_seq: Option<u64>,
+    /// Command records forwarded by this process for which no feedback has come back yet.
+    /// Only kept when the configuration names a feedback key.
+    awaiting_feedback: BTreeSet<usize>,
 }
 
 /// Time spent in storage steps over one interval between records, on the monotonic clock.
@@ -198,6 +204,8 @@ impl Recorder {
             writes_of_kind: BTreeMap::new(),
             last_receipt_seq: None,
             awaiting_receipt: BTreeSet::new(),
+            last_feedback_seq: None,
+            awaiting_feedback: BTreeSet::new(),
         };
         // A test build can be told to make one flush slow: SL_TEST_SLOW_FLUSH=kind:which:ms.
         #[cfg(feature = "test-slow-flush")]
@@ -242,6 +250,7 @@ impl Recorder {
                         }
                     }
                     Some("gate_receipt") => rec.last_receipt_seq = r["receipt"]["seq"].as_u64(),
+                    Some("actuator_feedback") => rec.last_feedback_seq = r["feedback"]["seq"].as_u64(),
                     _ => {}
                 }
                 rec.last_at = Some(parse_at(r["at"].as_str().unwrap_or(""))?);
@@ -606,6 +615,9 @@ impl Recorder {
         if self.config.gate_public_key.is_some() {
             self.awaiting_receipt.insert(n);
         }
+        if self.config.feedback_public_key.is_some() {
+            self.awaiting_feedback.insert(n);
+        }
         self.anchor(false).map_err(|e| self.enter_fault("anchor", e))?;
         // The command has gone to the gate. If writing it stalled, say so now.
         self.report_stalls().map_err(|e| self.enter_fault("append", e))?;
@@ -638,6 +650,9 @@ impl Recorder {
             }
             if parsed.gate_public_key != self.config.gate_public_key {
                 return Err("the installed configuration names a different gate key; key rotation is not supported".to_string());
+            }
+            if parsed.feedback_public_key != self.config.feedback_public_key {
+                return Err("the installed configuration names a different feedback key; key rotation is not supported".to_string());
             }
             new_config = Some(parsed);
             changes.push(json!({"target": "config", "expected": self.state.config_sha256, "measured": sha}));
@@ -724,7 +739,10 @@ impl Recorder {
             if names(&c) != names(&self.config) {
                 return Err(Fail::Rejected("the set of software components is fixed at genesis".to_string()));
             }
-            if c.recorder_public_key != self.config.recorder_public_key || c.gate_public_key != self.config.gate_public_key {
+            if c.recorder_public_key != self.config.recorder_public_key
+                || c.gate_public_key != self.config.gate_public_key
+                || c.feedback_public_key != self.config.feedback_public_key
+            {
                 return Err(Fail::Rejected("key rotation is not supported".to_string()));
             }
             new_config = Some(c);
@@ -861,6 +879,56 @@ impl Recorder {
     /// Always 0 when the configuration names no gate key.
     pub fn receipts_outstanding(&self) -> usize {
         self.awaiting_receipt.len()
+    }
+
+    /// Section 4.6: take the actuator's feedback for a command, signed with the feedback
+    /// key, and write it into the journal as a record of its own. Returns the record's
+    /// number and the feedback's.
+    ///
+    /// The same two checks as for a receipt: that the feedback is signed with the feedback
+    /// key the configuration names, and that its number is higher than the last one
+    /// written. Whether it names the right command, and what it says the actuator did, is
+    /// the verifier's to judge, not the recorder's.
+    pub fn actuator_feedback(&mut self, feedback: &Value) -> Result<(usize, u64), Fail> {
+        if self.stopped {
+            return Err(Fail::Rejected("the recorder has stopped".to_string()));
+        }
+        if let Some(why) = self.fault.clone() {
+            return Err(Fail::Fault(why));
+        }
+        let Some(feedback_key) = self.config.feedback_public_key.clone() else {
+            return Err(Fail::Rejected("the configuration names no feedback key".to_string()));
+        };
+        let fields = object(Some(feedback), "feedback")?;
+        if fields.get("schema").and_then(Value::as_str) != Some(FEEDBACK_SCHEMA) {
+            return Err(Fail::Rejected(format!("feedback's schema must be {FEEDBACK_SCHEMA}")));
+        }
+        let Some(seq) = fields.get("seq").and_then(Value::as_u64) else {
+            return Err(Fail::Rejected("feedback needs its number, seq".to_string()));
+        };
+        let mut unsigned = fields.clone();
+        let sig = unsigned.remove("sig");
+        let text = canonical(&Value::Object(unsigned)).map_err(|e| Fail::Rejected(format!("feedback: {e}")))?;
+        if !signing::verify(&feedback_key, &text, sig.as_ref().and_then(Value::as_str).unwrap_or("")) {
+            return Err(Fail::Rejected("the feedback is not signed with the feedback key".to_string()));
+        }
+        if self.last_feedback_seq.is_some_and(|last| seq <= last) {
+            return Err(Fail::Rejected(format!("feedback {seq} is not newer than the last one in the journal")));
+        }
+        let mut record = Map::new();
+        record.insert("feedback".into(), Value::Object(fields.clone()));
+        let n = self.append("actuator_feedback", record).map_err(|e| self.enter_fault("append", e))?;
+        self.last_feedback_seq = Some(seq);
+        if let Some(of) = fields.get("n").and_then(Value::as_u64) {
+            self.awaiting_feedback.remove(&(of as usize));
+        }
+        Ok((n, seq))
+    }
+
+    /// How many command records this process has forwarded and has no feedback for yet.
+    /// Always 0 when the configuration names no feedback key.
+    pub fn feedback_outstanding(&self) -> usize {
+        self.awaiting_feedback.len()
     }
 
     /// The limits for converting a ROS Twist, from the configuration in force.
@@ -1241,6 +1309,142 @@ mod tests {
             Err(Fail::Rejected(why)) => assert!(why.contains("no gate key")),
             _ => panic!("expected a rejection"),
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A recorder whose configuration names a feedback key, and that key.
+    fn with_feedback_key(name: &str) -> (PathBuf, Recorder, SigningKey) {
+        let dir = std::env::temp_dir().join(format!("sl-{name}-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key_file = dir.join("recorder.key");
+        let public = signing::generate(&key_file).unwrap();
+        installed(&dir.join("installed"), &public);
+        let reporter = SigningKey::from_bytes(&[5u8; 32]);
+        let config = dir.join("installed/config.json");
+        let text = fs::read_to_string(&config).unwrap().replace(
+            "\"measure_every\":5",
+            &format!("\"measure_every\":50,\"feedback_public_key\":\"{}\"", signing::public_hex(&reporter)),
+        );
+        fs::write(&config, text).unwrap();
+        let clock = Clock::Fixed(parse_at("2026-10-01T08:00:00Z").unwrap());
+        let link = Link::File(dir.join("link.jsonl"));
+        let r = Recorder::open(&dir.join("data"), &dir.join("installed"), &key_file, link, clock).unwrap();
+        (dir, r, reporter)
+    }
+
+    fn feedback(key: &SigningKey, seq: u64, n: Value, speed: i64) -> Value {
+        let mut body = json!({"schema": FEEDBACK_SCHEMA, "seq": seq, "n": n, "hash": null,
+            "sent": {"speed_mm_s": speed}, "measured": {"speed_mm_s": speed}, "state": null,
+            "after_ms": 50, "at_ms": null});
+        let sig = signing::sign(key, &canonical(&body).unwrap());
+        body["sig"] = json!(sig);
+        body
+    }
+
+    /// Feedback signed with the feedback key becomes a signed record of the recorder's,
+    /// holding the feedback whole, and answers for the command it names.
+    #[test]
+    fn feedback_signed_with_the_feedback_key_is_written_as_a_record() {
+        let (dir, mut r, reporter) = with_feedback_key("feedback");
+        let (n, _) = r.command(&json!({"requested": {"speed_mm_s": 1}})).unwrap();
+        assert_eq!((r.feedback_outstanding(), r.receipts_outstanding()), (1, 0));
+        let sent = feedback(&reporter, 0, json!(n), 1);
+        let (at, seq) = r.actuator_feedback(&sent).unwrap();
+        assert_eq!((seq, r.feedback_outstanding()), (0, 0));
+        let all = records(&dir);
+        assert_eq!(all[at]["kind"], json!("actuator_feedback"));
+        assert_eq!(all[at]["feedback"], sent);
+        assert_eq!(all[at]["sig"].as_str().unwrap().len(), 128);
+        // It went to the gate like every record, so the gate's head covers it.
+        let link = fs::read_to_string(dir.join("link.jsonl")).unwrap();
+        assert_eq!(link.lines().count(), all.len());
+        assert_eq!(all[0]["settings"]["feedback_public_key"], json!(signing::public_hex(&reporter)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What is not written: feedback signed with another key, feedback whose contents or
+    /// command were changed after signing, feedback sent twice, and anything that is not
+    /// feedback.
+    #[test]
+    fn feedback_not_signed_with_the_feedback_key_or_already_sent_is_not_written() {
+        let (dir, mut r, reporter) = with_feedback_key("badfeedback");
+        let before = records(&dir).len();
+        let other = SigningKey::from_bytes(&[9u8; 32]);
+        let refused = |r: &mut Recorder, v: &Value| match r.actuator_feedback(v) {
+            Err(Fail::Rejected(why)) => why,
+            _ => panic!("expected a rejection"),
+        };
+        assert!(refused(&mut r, &feedback(&other, 0, json!(2), 1)).contains("not signed with the feedback key"));
+        let mut changed = feedback(&reporter, 0, json!(2), 1);
+        changed["measured"] = json!({"speed_mm_s": 900});
+        assert!(refused(&mut r, &changed).contains("not signed with the feedback key"));
+        let mut moved = feedback(&reporter, 0, json!(2), 1);
+        moved["n"] = json!(3);
+        assert!(refused(&mut r, &moved).contains("not signed with the feedback key"));
+        let mut unsigned = feedback(&reporter, 0, json!(2), 1);
+        unsigned.as_object_mut().unwrap().remove("sig");
+        assert!(refused(&mut r, &unsigned).contains("not signed with the feedback key"));
+        assert!(refused(&mut r, &json!("feedback")).contains("JSON object"));
+        assert!(refused(&mut r, &json!({"seq": 0})).contains("schema"));
+        assert_eq!(records(&dir).len(), before);
+        assert!(r.fault.is_none());
+
+        r.actuator_feedback(&feedback(&reporter, 0, json!(2), 1)).unwrap();
+        r.actuator_feedback(&feedback(&reporter, 1, json!(3), 1)).unwrap();
+        // Sent again, by the reporter or by anyone who saw it go past.
+        assert!(refused(&mut r, &feedback(&reporter, 1, json!(3), 1)).contains("not newer"));
+        assert!(refused(&mut r, &feedback(&reporter, 0, json!(2), 1)).contains("not newer"));
+        assert_eq!(records(&dir).len(), before + 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// After a restart the recorder still knows the last feedback it wrote, from the journal.
+    #[test]
+    fn the_last_feedback_number_is_recovered_from_the_journal() {
+        let (dir, mut r, reporter) = with_feedback_key("feedbackrestart");
+        r.actuator_feedback(&feedback(&reporter, 0, json!(2), 1)).unwrap();
+        r.actuator_feedback(&feedback(&reporter, 1, json!(3), 1)).unwrap();
+        r.stop().unwrap();
+        drop(r);
+        let clock = Clock::Fixed(parse_at("2026-10-01T09:00:00Z").unwrap());
+        let link = Link::File(dir.join("link.jsonl"));
+        let mut r = Recorder::open(&dir.join("data"), &dir.join("installed"), &dir.join("recorder.key"), link, clock).unwrap();
+        assert!(matches!(r.actuator_feedback(&feedback(&reporter, 1, json!(3), 1)), Err(Fail::Rejected(_))));
+        assert!(r.actuator_feedback(&feedback(&reporter, 2, json!(4), 1)).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A machine whose configuration names no feedback key takes none and waits for none.
+    #[test]
+    fn without_a_feedback_key_no_feedback_is_taken() {
+        let (dir, mut r) = fresh("nofeedbackkey");
+        r.command(&json!({"requested": {"speed_mm_s": 1}})).unwrap();
+        assert_eq!(r.feedback_outstanding(), 0);
+        let reporter = SigningKey::from_bytes(&[5u8; 32]);
+        match r.actuator_feedback(&feedback(&reporter, 0, json!(2), 1)) {
+            Err(Fail::Rejected(why)) => assert!(why.contains("no feedback key")),
+            _ => panic!("expected a rejection"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The feedback key cannot be changed: not by a declared change, and not behind the
+    /// recorder's back.
+    #[test]
+    fn the_feedback_key_cannot_be_changed() {
+        let (dir, mut r, reporter) = with_feedback_key("feedbackrotation");
+        let config = dir.join("installed/config.json");
+        let text = fs::read_to_string(&config).unwrap();
+        let (now, other) = (signing::public_hex(&reporter), signing::public_hex(&SigningKey::from_bytes(&[6u8; 32])));
+        assert!(text.contains(&now));
+        let changed = dir.join("changed.json");
+        fs::write(&changed, text.replace(&now, &other)).unwrap();
+        let declared = r.declare(&json!({"target": "config", "file": changed.to_str().unwrap(),
+            "operator": "o", "reference": "r"}));
+        assert!(matches!(declared, Err(Fail::Rejected(why)) if why.contains("key rotation")));
+        fs::write(&config, text.replace(&now, &other)).unwrap();
+        assert!(r.measure().unwrap_err().contains("different feedback key"));
         let _ = fs::remove_dir_all(&dir);
     }
 

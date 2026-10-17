@@ -7,6 +7,7 @@
   "gate_deadman_seconds": 4,
   "gate_max_command_age_ms": 1000,
   "gate_public_key": "",
+  "feedback_public_key": "",
   "twist_limits": {"linear_mm_s": 5000, "angular_mrad_s": 10000},
   "safe_state_action": {
     "linear_x_mm_s": 0, "linear_y_mm_s": 0, "linear_z_mm_s": 0,

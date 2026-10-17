@@ -180,15 +180,18 @@ class Machine:
     of its own), and the test in place of the wire between them: it hands the gate each
     message the recorder sends, and hands the recorder each receipt the gate signs."""
 
-    def __init__(self, tmp_path, recorder, age_limit=None, deadman=None):
+    def __init__(self, tmp_path, recorder, age_limit=None, deadman=None, gate_key=GATE_SEED, more_config=""):
+        """`gate_key=None`: a gate that signs no receipts, on a machine whose configuration
+        names no gate key. `more_config`: further lines for the configuration file."""
         self.w = run_scenarios.Workspace(str(tmp_path), "receipts", recorder)
         config = os.path.join(self.w.installed, "config.json")
+        named = '\n  "gate_public_key": "%s",' % GATE_PUBLIC if gate_key is not None else ""
         with open(config, encoding="utf-8") as fh:
-            text = fh.read().replace('"anchor_every": 4,', '"anchor_every": 4,\n  "gate_public_key": "%s",' % GATE_PUBLIC)
-        assert GATE_PUBLIC in text
+            text = fh.read().replace('"anchor_every": 4,', '"anchor_every": 4,' + named + more_config)
+        assert (GATE_PUBLIC in text) == (gate_key is not None)
         with open(config, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
-        self.gate = Gate(self.w.gate_state, SAFE, self.w.public_key, deadman, age_limit, gate_key=GATE_SEED)
+        self.gate = Gate(self.w.gate_state, SAFE, self.w.public_key, deadman, age_limit, gate_key=gate_key)
         self.proc = subprocess.Popen(self.w.run_args("2026-10-01T08:00:00Z"), stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, text=True)
         self.offset, self.now, self.late_ms = 0, 0.0, 0

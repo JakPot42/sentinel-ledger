@@ -20,7 +20,9 @@ the scenario calls for it, a rogue node publishing on cmd_vel_out.
 
 The robot's gate signs a receipt for every command record it takes in, every message it
 refuses and every deadman trip, and the recorder writes each receipt into the journal.
-Every scenario checks the receipts the journal ends up holding.
+After each command record it takes in, the robot also signs, with the feedback key, what
+its wheels then did, and the recorder writes that into the journal too. Every scenario
+checks the receipts and the feedback the journal ends up holding.
 
 Exit 0 only if every observation of every scenario is the expected one.
 
@@ -44,6 +46,9 @@ Exit 0 only if every observation of every scenario is the expected one.
      verifier reports both
  12  the folder for anchor statements becomes unwritable: commands still go through, and
      the recorder states the lost anchor in a signed record, which the verifier reports
+ 13  the wheels do not turn (a test switch in the simulated robot): the gate applies each
+     command and says so in its receipt, and the feedback in the journal says the wheels
+     did not move
 """
 import argparse
 import hashlib
@@ -112,10 +117,17 @@ class Session:
         with os.fdopen(os.open(self.gate_key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
             fh.write(gate_seed.hex() + "\n")
         self.gate_public_key = ed.public_key(gate_seed).hex()
+        # The feedback key, for what the wheels did: a third key, also on the robot's side.
+        self.feedback_key_file = os.path.join(self.dir, "robot_private", "feedback.key")
+        feedback_seed = os.urandom(32)
+        with os.fdopen(os.open(self.feedback_key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+            fh.write(feedback_seed.hex() + "\n")
+        self.feedback_public_key = ed.public_key(feedback_seed).hex()
         config_path = os.path.join(self.installed, "config.json")
         with open(config_path, encoding="utf-8") as fh:
             config = fh.read().replace('"recorder_public_key": ""', '"recorder_public_key": "%s"' % self.public_key)
             config = config.replace('"gate_public_key": ""', '"gate_public_key": "%s"' % self.gate_public_key)
+            config = config.replace('"feedback_public_key": ""', '"feedback_public_key": "%s"' % self.feedback_public_key)
         with open(config_path, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(config)
         self.data = os.path.join(self.dir, "data")
@@ -224,6 +236,7 @@ class Session:
             except TimedOut:
                 pass
             self.receipt_settled(seen, judged, lambda e: e.get("of") == reply["n"])
+            self.feedback_settled(seen, judged, reply["n"])
         self.quiet(0.2)
         return reply
 
@@ -237,6 +250,19 @@ class Session:
             if found()[0].get("ok"):
                 self.wait(lambda: any(e.get("head", -1) >= found()[0]["n"] for e in self.gate_events[judged:]),
                           3, "the receipt's record to reach the gate")
+        except TimedOut:
+            pass
+
+    def feedback_settled(self, seen, judged, n):
+        """Wait until the feedback for command record `n` has been written into the journal
+        and its record has reached the gate. If it never comes, carry on: what the journal
+        then lacks is for the verifier to say."""
+        found = lambda: [e for e in self.statuses[seen:] if e.get("kind") == "actuator_feedback" and e.get("of") == n]
+        try:
+            self.wait(lambda: bool(found()), 3, "the actuator's feedback")
+            if found()[0].get("ok"):
+                self.wait(lambda: any(e.get("head", -1) >= found()[0]["n"] for e in self.gate_events[judged:]),
+                          3, "the feedback's record to reach the gate")
         except TimedOut:
             pass
 
@@ -277,7 +303,8 @@ class Session:
         done = subprocess.run(
             [sys.executable, VERIFIER, self.journal, "--root", str(root or self.state_root()),
              "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state,
-             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key, "--json"],
+             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key,
+             "--feedback-public-key", self.feedback_public_key, "--json"],
             capture_output=True, text=True)
         try:
             return done.returncode, json.loads(done.stdout)
@@ -289,7 +316,8 @@ class Session:
         done = subprocess.run(
             [sys.executable, VERIFIER, self.journal, "--root", str(root or self.state_root()),
              "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state,
-             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key],
+             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key,
+             "--feedback-public-key", self.feedback_public_key],
             capture_output=True, text=True)
         with open(os.path.join(self.dir, "verifier_output.txt"), "w", encoding="utf-8") as fh:
             fh.write(done.stdout)
@@ -316,6 +344,27 @@ class Session:
             else:
                 said.append(receipt["decision"])
         return said
+
+    def feedback(self, field="linear_x_mm_s"):
+        """For each command record in the journal, in order: what the feedback signed with
+        the feedback key says the wheels did (one field of `measured`), "none" when no such
+        feedback names that record by number and hash, or "twice" when more than one does."""
+        with open(self.journal, encoding="utf-8") as fh:
+            entries = [json.loads(line) for line in fh]
+        records = [json.loads(e["raw"]) for e in entries]
+        said = {}
+        for record in records:
+            if record["kind"] != "actuator_feedback":
+                continue
+            report = record["feedback"]
+            body = {k: v for k, v in report.items() if k != "sig"}
+            text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            if not ed.verify(bytes.fromhex(self.feedback_public_key), text.encode("utf-8"), bytes.fromhex(report["sig"])):
+                continue
+            n = report["n"]
+            if 0 <= n < len(entries) and entries[n]["hash"] == report["hash"]:
+                said[n] = "twice" if n in said else report["measured"][field]
+        return [said.get(r["n"], "none") for r in records if r["kind"] == "command"]
 
     def recorder_pid(self):
         """The process id of this scenario's recorder node, found by what it is running
@@ -355,7 +404,8 @@ def kinds(report):
 def summary(s, stopped, report_pair):
     code, report = report_pair
     return {"recorder_exit": s.exits[-1][0], "robot_exit": s.exits[-1][1], "verifier_exit": code,
-            "findings": kinds(report), "stopped_cleanly": bool(stopped.get("ok")), "receipts": s.receipts()}
+            "findings": kinds(report), "stopped_cleanly": bool(stopped.get("ok")), "receipts": s.receipts(),
+            "feedback": s.feedback()}
 
 
 def scenario_1(s):
@@ -467,7 +517,7 @@ def scenario_5(s):
     stopped = s.end()
     code, report = s.verify(stopped.get("root"))
     obs.update(restart_reply_ok=again.get("ok"), exits_after_restart=s.exits[-1],
-               receipts_after_restart=s.receipts(),
+               receipts_after_restart=s.receipts(), feedback_after_restart=s.feedback(),
                verifier_exit_after_restart=code, findings_after_restart=kinds(report),
                applied_after_restart=[v for why, v in s.sent() if why == "applied"][len(obs["applied"]):])
     return obs
@@ -664,27 +714,48 @@ def scenario_12(s):
     return obs
 
 
+def scenario_13(s):
+    # The wheels ignore every action. The gate does its job and the robot does not move.
+    s.extra_env = {"SL_TEST_STUCK_WHEELS": "1"}
+    s.launch()
+    s.inputs(CLEAR)
+    s.command(0.5)
+    s.quiet(1)
+    s.command(0.3)
+    s.quiet(1)
+    stopped = s.end()
+    obs = summary(s, stopped, s.verify(stopped.get("root")))
+    obs.update(sent=s.sent(), robot_did_not_move=s.robot_exit_file()["pose"] == [0.0, 0.0, 0.0],
+               reports_published=s.robot_exit_file().get("feedback_reports"))
+    return obs
+
+
 SCENARIOS = {1: scenario_1, 2: scenario_2, 3: scenario_3, 4: scenario_4, 5: scenario_5, 6: scenario_6,
-             7: scenario_7, 8: scenario_8, 9: scenario_9, 10: scenario_10, 11: scenario_11, 12: scenario_12}
+             7: scenario_7, 8: scenario_8, 9: scenario_9, 10: scenario_10, 11: scenario_11, 12: scenario_12,
+             13: scenario_13}
 NEEDS_SLOW_FLUSH_NODE = (11,)
 CLEAN = {"recorder_exit": 0, "robot_exit": 0, "verifier_exit": 0, "findings": [], "stopped_cleanly": True}
 REFUSED = (False, "gate_refused")
-# Every scenario also says which receipts the journal must hold, in order.
+# Every scenario also says which receipts the journal must hold, in order, and for each
+# command record what the feedback signed with the feedback key says the wheels did.
 EXPECTED = {
-    1: dict(CLEAN, receipts=["applied"] * 5, commands=5, unchanged=5, at_least_two_heartbeats=True,
+    1: dict(CLEAN, receipts=["applied"] * 5, feedback=[200, 400, 100, 900, 300],
+            commands=5, unchanged=5, at_least_two_heartbeats=True,
             sent=[("applied", 200), ("applied", 400), ("applied", 100), ("applied", 900), ("applied", 300)],
             all_six_fields={"linear_x_mm_s": 100, "linear_y_mm_s": 20, "linear_z_mm_s": 3,
                             "angular_x_mrad_s": 400, "angular_y_mrad_s": 50, "angular_z_mrad_s": 6}),
-    2: dict(CLEAN, receipts=["applied"] * 4,
+    2: dict(CLEAN, receipts=["applied"] * 4, feedback=[800, 1500, -1500, 1500],
             replies_ok=[True, True, True, False, False, False, True], commands=4, changed=2, unchanged=2,
             sent=[("applied", 800), ("applied", 1500), ("applied", -1500), ("applied", 1500)],
             clamped_record_requested=1800, clamped_record_applied=1500, clamped_record_rules=["R2-forward-speed"]),
-    3: dict(CLEAN, receipts=["blocked", "applied", "blocked", "applied"], first_outcome="blocked", blocked=2,
+    3: dict(CLEAN, receipts=["blocked", "applied", "blocked", "applied"], feedback=[0, 500, 0, 500],
+            first_outcome="blocked", blocked=2,
             sent=[("blocked", 0), ("applied", 500), ("blocked", 0), ("applied", 500)]),
-    4: dict(CLEAN, receipts=["applied"] * 3,
+    4: dict(CLEAN, receipts=["applied"] * 3, feedback=[400, 1000, 900],
             declare_ok=True, declared=1, detected=1, changed=1, exits_first_launch=(0, 0),
             sent=[("applied", 400), ("applied", 1000), ("applied", 900)]),
     5: dict(CLEAN, receipts=["applied"] * 2, receipts_after_restart=["applied"] * 3,
+            feedback=[500, 700], feedback_after_restart=[500, 700, 400],
             recorder_exit=3, stopped_cleanly=False, replies_ok=[True, True, False, False],
             commands_recorded=2, applied=[500, 700], only_safe_state_after_the_fault=True,
             restart_reply_ok=True, exits_after_restart=(0, 0), verifier_exit_after_restart=2,
@@ -693,7 +764,7 @@ EXPECTED = {
     6: dict(CLEAN, robot_exit=2, verifier_exit=2, findings=["GATE_REFUSED"],
             receipts=["applied", "refused:form", "refused:form", "refused:chain", "refused:form",
                       "refused:signature", "applied"],
-            no_record=REFUSED, not_json=REFUSED, replay=REFUSED, tampered=REFUSED,
+            feedback=[500, 600], no_record=REFUSED, not_json=REFUSED, replay=REFUSED, tampered=REFUSED,
             gap=REFUSED, replay_refused_for_its_position=True, command_after_ok=True,
             sent=[("applied", 500)] + [("gate_refused", 0)] * 5 + [("applied", 600)]),
 }
@@ -701,7 +772,7 @@ EXPECTED = {
 # moves at the forger's 1500, the recorder's own next command still goes through, and the
 # journal is whole. The journal also says the gate refused something, and why.
 FORGERY_REFUSED = dict(CLEAN, robot_exit=2, verifier_exit=2, findings=["GATE_REFUSED"],
-                       receipts=["applied", "refused:signature", "applied"],
+                       receipts=["applied", "refused:signature", "applied"], feedback=[500, 600],
                        forged=REFUSED, refused_for_its_signature=True, command_after_ok=True,
                        sent=[("applied", 500), ("gate_refused", 0), ("applied", 600)])
 EXPECTED.update({7: FORGERY_REFUSED, 8: FORGERY_REFUSED, 9: FORGERY_REFUSED})
@@ -709,7 +780,8 @@ EXPECTED.update({7: FORGERY_REFUSED, 8: FORGERY_REFUSED, 9: FORGERY_REFUSED})
 # in the journal as a gap, because nothing the recorder wrote explains it. The deadman
 # trip is in the journal too, as the gate's receipt, written once the recorder is back.
 EXPECTED[10] = dict(CLEAN, verifier_exit=2, findings=["GATE_DEADMAN", "HEARTBEAT_GAP"],
-                    receipts=["applied", "deadman", "applied"], deadman_trips=1, tripped_in_time=True,
+                    receipts=["applied", "deadman", "applied"], feedback=[500, 300], deadman_trips=1,
+                    tripped_in_time=True,
                     robot_stopped_short=True, command_after_ok=True,
                     sent=[("applied", 500), ("deadman", 0), ("applied", 300)])
 # A six-second flush: the robot is stopped by the deadman at four seconds and stays
@@ -719,7 +791,7 @@ EXPECTED[10] = dict(CLEAN, verifier_exit=2, findings=["GATE_DEADMAN", "HEARTBEAT
 # The journal also holds the gate's receipts for the deadman trip and for the refusal.
 EXPECTED[11] = dict(CLEAN, robot_exit=2, verifier_exit=2,
                     findings=["GATE_DEADMAN", "GATE_REFUSED", "STORAGE_STALL"],
-                    receipts=["applied", "deadman", "refused:age", "applied"],
+                    receipts=["applied", "deadman", "refused:age", "applied"], feedback=[500, 0, 300],
                     age_refusal_in_journal=True, verifier_reports_the_age_refusal=True,
                     verifier_output_shows_it=True, the_record_itself_is_unchanged=True, deadman_trips=1,
                     slow_command_ok=True, stale_refusals=1, stale_command_was_the_slow_one=True,
@@ -729,11 +801,18 @@ EXPECTED[11] = dict(CLEAN, robot_exit=2, verifier_exit=2,
 # Anchor statements cannot be written: not a fault, every command goes out, and the
 # journal carries a signed record of each statement lost. The verifier reports them.
 EXPECTED[12] = dict(CLEAN, verifier_exit=2, findings=["ANCHOR_FAILED"], receipts=["applied"] * 6,
+                    feedback=[500, 200, 300, 400, 500, 600],
                     replies_ok=[True] * 5,
                     anchor_failures_stated=True, each_names_a_statement_that_is_missing=True, each_is_signed=True,
                     status_also_said_so=True,
                     sent=[("applied", 500), ("applied", 200), ("applied", 300), ("applied", 400), ("applied", 500),
                           ("applied", 600)])
+# The wheels do not turn. The journal is clean, because nothing in it is false: the gate
+# applied both commands, as its receipts say, and the wheels did not move, as the feedback
+# says. The verifier checks the feedback is genuine and belongs to its command; whether the
+# robot did what it was told is there to read, and the verifier does not judge it.
+EXPECTED[13] = dict(CLEAN, receipts=["applied"] * 2, feedback=[0, 0], robot_did_not_move=True,
+                    reports_published=2, sent=[("applied", 500), ("applied", 300)])
 
 
 def run_scenario(number, node_bin, out):

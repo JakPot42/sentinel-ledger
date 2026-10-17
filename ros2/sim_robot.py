@@ -3,7 +3,7 @@
 
     sim_robot.py --state FILE --actuator FILE --safe-state JSON --public-key HEX
                  [--deadman-seconds N] [--max-command-age-ms N] [--gate-key FILE]
-                 [--exit-file FILE]
+                 [--feedback-key FILE --feedback-state FILE] [--exit-file FILE]
 
 It has one command input, the topic cmd_vel_out, and that input goes straight into the
 gate (gate/actuator_gate.py, the same code the file demo uses). The robot moves only on
@@ -16,6 +16,7 @@ Topics:
   robot_control  std_msgs/String  in   {"op":"shutdown"}, used by the demo to end a run
   gate_events    std_msgs/String  out  one JSON line per message judged
   gate_receipts  std_msgs/String  out  the gate's signed receipts, for the recorder to write down
+  actuator_feedback  std_msgs/String  out  signed reports of what the wheels did after each command
 
 The "robot" is a point with a pose. Twenty times a second it moves by its current
 velocity. Headless, so a run can be judged by exit code.
@@ -38,6 +39,19 @@ and for every deadman trip, and the robot publishes it on gate_receipts. The rec
 node writes each one into the journal. The robot acts first and signs afterwards. The
 key is the gate's own; the robot still holds no key that can sign a record.
 
+Feedback (docs/SPEC.md section 4.6): with --feedback-key, after acting on each command
+record the gate took into the chain, the robot reads what its wheels are doing and where
+odometry puts it, signs that with the feedback key and publishes it on actuator_feedback
+for the recorder to write down. The reading is taken on the first motion step at least one
+step after the action, or at once if anything else is about to be sent to the wheels
+first, so that it never describes a later action. In that case it is read before the new
+action and signed after it, so a stop never waits for a signature or a disk. `measured` is
+the wheels' velocity, under the same six keys as the action; `state` is the pose from
+odometry, in millimetres and milliradians.
+
+SL_TEST_STUCK_WHEELS=1 makes the wheels ignore every action: the robot is told to move and
+does not. For the scenario that shows the journal then says so; nothing else uses it.
+
 Exit codes: 0 the gate refused nothing, 2 it refused at least one message.
 """
 import argparse
@@ -53,10 +67,13 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-# SL_GATE_DIR lets a test put a deliberately broken gate in the robot (tests/test_ros2.py).
-sys.path.insert(0, os.environ.get("SL_GATE_DIR") or
-                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gate"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gate"))
+# SL_GATE_DIR lets a test put a deliberately broken gate, or a broken feedback reporter, in
+# the robot (tests/test_ros2.py). Whatever that folder does not hold comes from gate/.
+if os.environ.get("SL_GATE_DIR"):
+    sys.path.insert(0, os.environ["SL_GATE_DIR"])
 from actuator_gate import Gate, load_gate_key  # noqa: E402
+from actuator_feedback import FeedbackReporter, load_feedback_key  # noqa: E402
 
 LATCHED = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1000, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -71,6 +88,11 @@ class SimRobot(Node):
         self.gate = Gate(args.state, json.loads(args.safe_state), args.public_key, args.deadman_seconds,
                          args.max_command_age_ms, load_gate_key(args.gate_key) if args.gate_key else None)
         self.deadman_trips = 0
+        self.reporter = None
+        if args.feedback_key:
+            self.reporter = FeedbackReporter(args.feedback_state, load_feedback_key(args.feedback_key))
+        self.reported = 0
+        self.stuck = os.environ.get("SL_TEST_STUCK_WHEELS") == "1"
         self.actuator_path = args.actuator
         self.velocity = dict.fromkeys(FIELDS, 0)
         self.pose = [0.0, 0.0, 0.0]  # x in metres, y in metres, heading in radians
@@ -78,6 +100,7 @@ class SimRobot(Node):
         self.done = False
         self.events = self.create_publisher(String, "gate_events", LATCHED)
         self.receipts = self.create_publisher(String, "gate_receipts", LATCHED)
+        self.feedback = self.create_publisher(String, "actuator_feedback", LATCHED)
         self.create_subscription(String, "cmd_vel_out", self.on_message, LATCHED)
         self.create_subscription(String, "robot_control", self.on_control, 10)
         self.create_timer(STEP, self.move)
@@ -96,6 +119,8 @@ class SimRobot(Node):
         # Act first, then sign and write things down: neither the signature nor a slow
         # disk on the robot's side may delay a stop.
         self.act(decision)
+        if self.reporter is not None:
+            self.reporter.follow(decision, time.monotonic())
         receipt = self.gate.issue_receipt(decision, wall_ms=int(time.time() * 1000))
         self.gate.save()
         event = {"judged": self.judged, "accepted": decision["accepted"], "n": decision["n"],
@@ -108,13 +133,40 @@ class SimRobot(Node):
         if receipt is not None:
             self.receipts.publish(String(data=json.dumps(receipt, sort_keys=True, separators=(",", ":"))))
 
+    def wheels(self):
+        """What the wheels are doing: the velocity they were given, unless they are stuck."""
+        return dict.fromkeys(FIELDS, 0) if self.stuck else dict(self.velocity)
+
+    def read_wheels(self):
+        """The reading due, if one is: the wheels, the pose, and when. None otherwise."""
+        if self.reporter is None or not self.reporter.due():
+            return None
+        pose = {"x_mm": int(round(self.pose[0] * 1000)), "y_mm": int(round(self.pose[1] * 1000)),
+                "heading_mrad": int(round(self.pose[2] * 1000))}
+        return self.wheels(), pose, time.monotonic(), int(time.time() * 1000)
+
+    def send_feedback(self, reading):
+        """Sign a reading taken by read_wheels, keep the reporter's number, publish it."""
+        if reading is None:
+            return
+        measured, pose, now, wall_ms = reading
+        report = self.reporter.report(measured, pose, now=now, wall_ms=wall_ms)
+        self.reported += 1
+        self.feedback.publish(String(data=json.dumps(report, sort_keys=True, separators=(",", ":"))))
+
     def act(self, decision):
         if decision["send"] is not None:
+            # A reading still due describes the action now ending. Its numbers are taken
+            # before the wheels are given anything else, or they would describe the wrong
+            # command. It is signed and written down after: like a receipt, it must not
+            # delay the action, which may be a stop.
+            reading = self.read_wheels()
             # This is the only place the robot's velocity is ever set.
             self.velocity = {f: int(decision["send"].get(f, 0)) for f in FIELDS}
             with open(self.actuator_path, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps({"n": decision["n"], "sent": decision["send"], "why": decision["why"]},
                                     sort_keys=True, separators=(",", ":")) + "\n")
+            self.send_feedback(reading)
 
     def on_control(self, msg):
         if "shutdown" in msg.data:
@@ -132,11 +184,15 @@ class SimRobot(Node):
                  "silent_seconds": tripped["silent_seconds"], "pose": [round(p, 3) for p in self.pose]},
                 sort_keys=True)))
             self.send_receipt(receipt)
-        vx, vy = self.velocity["linear_x_mm_s"] / 1000.0, self.velocity["linear_y_mm_s"] / 1000.0
+        wheels = self.wheels()
+        vx, vy = wheels["linear_x_mm_s"] / 1000.0, wheels["linear_y_mm_s"] / 1000.0
         heading = self.pose[2]
         self.pose[0] += (vx * math.cos(heading) - vy * math.sin(heading)) * STEP
         self.pose[1] += (vx * math.sin(heading) + vy * math.cos(heading)) * STEP
-        self.pose[2] += self.velocity["angular_z_mrad_s"] / 1000.0 * STEP
+        self.pose[2] += wheels["angular_z_mrad_s"] / 1000.0 * STEP
+        # The reading for the last command, once its action has been in force for a step.
+        if self.reporter is not None and self.reporter.due(time.monotonic(), STEP):
+            self.send_feedback(self.read_wheels())
 
 
 def main(argv=None):
@@ -148,8 +204,12 @@ def main(argv=None):
     ap.add_argument("--deadman-seconds", type=int, help="no valid record for this long means the safe state")
     ap.add_argument("--max-command-age-ms", type=int, help="a command older than this is not carried out")
     ap.add_argument("--gate-key", help="the gate's own signing key file; with it the gate signs receipts")
+    ap.add_argument("--feedback-key", help="the feedback key file; with it the robot signs what its wheels did")
+    ap.add_argument("--feedback-state", help="where the feedback reporter keeps the number of its next report")
     ap.add_argument("--exit-file", help="the exit code is also written here, for a launcher")
     args, _ = ap.parse_known_args(argv)
+    if bool(args.feedback_key) != bool(args.feedback_state):
+        ap.error("--feedback-key and --feedback-state go together")
 
     rclpy.init()
     robot = SimRobot(args)
@@ -162,7 +222,8 @@ def main(argv=None):
     if args.exit_file:
         with open(args.exit_file, "w", encoding="utf-8") as fh:
             json.dump({"exit": code, "accepted": robot.accepted, "refused": robot.refused,
-                       "deadman_trips": robot.deadman_trips, "pose": [round(p, 3) for p in robot.pose]}, fh)
+                       "deadman_trips": robot.deadman_trips, "feedback_reports": robot.reported,
+                       "pose": [round(p, 3) for p in robot.pose]}, fh)
     robot.destroy_node()
     if rclpy.ok():
         rclpy.shutdown()

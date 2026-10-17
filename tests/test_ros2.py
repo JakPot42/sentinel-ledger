@@ -57,7 +57,7 @@ def tmp_path(tmp_path):
         shutil.rmtree(folder, ignore_errors=True)
 
 
-@pytest.mark.parametrize("number", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12])
+@pytest.mark.parametrize("number", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13])
 def test_ros_scenario_is_as_expected(number, ros_node, tmp_path):
     code, observed = run(number, ros_node(), tmp_path)
     want = expected(number)
@@ -137,10 +137,12 @@ def test_planted_bug_node_drops_a_record(ros_node, tmp_path):
     assert code == 2
     assert observed["robot_exit"] == 2
     # The journal is whole, and it now says what the gate did: it holds the gate's signed
-    # refusals, and the commands that were refused have no receipt saying they were applied.
-    # With every record refused, no valid record arrives, and the deadman trips as well.
+    # refusals, and the commands that were refused have no receipt saying they were applied,
+    # and no report of what the wheels did, since the robot never acted on them. With every
+    # record refused, no valid record arrives, and the deadman trips as well.
     assert observed["verifier_exit"] == 2
-    assert observed["findings"] == ["COMMAND_WITHOUT_RECEIPT", "GATE_DEADMAN", "GATE_REFUSED"]
+    assert observed["findings"] == ["COMMAND_WITHOUT_FEEDBACK", "COMMAND_WITHOUT_RECEIPT", "GATE_DEADMAN",
+                                    "GATE_REFUSED"]
     assert "refused:chain" in observed["receipts"] and "deadman" in observed["receipts"]
     assert [why for why, _ in observed["sent"] if why == "applied"] == [] or \
         len([why for why, _ in observed["sent"] if why == "applied"]) < 5
@@ -315,6 +317,32 @@ def test_planted_bug_gate_signs_no_receipts(ros_node, tmp_path):
 
     code, observed = run(3, ros_node(), tmp_path)
     assert code == 0 and observed["receipts"] == ["blocked", "applied", "blocked", "applied"]
+
+
+def test_planted_bug_reporter_reports_only_commands_that_moved_the_wheels(ros_node, tmp_path):
+    """The feedback reporter follows applied commands only. In scenario 3 the two blocked
+    commands, where the wheels were given the safe state, have no feedback, and the
+    verifier reports both. The robot moves exactly as before.
+
+    Planted the same way as the gate bugs: a copy of the reporter with one line changed,
+    after proving the line was there to change. The robot takes the gate from gate/."""
+    broken = tmp_path / "reporter_that_skips_blocked"
+    broken.mkdir()
+    with open(os.path.join(REPO, "gate", "actuator_feedback.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    line = 'FOLLOWS_A_COMMAND = ("applied", "blocked", "stale_command")'
+    assert source.count(line) == 1
+    (broken / "actuator_feedback.py").write_text(source.replace(line, 'FOLLOWS_A_COMMAND = ("applied",)'),
+                                                 encoding="utf-8")
+
+    code, observed = run(3, ros_node(), tmp_path, SL_GATE_DIR=str(broken))
+    assert code == 2
+    assert observed["sent"] == [["blocked", 0], ["applied", 500], ["blocked", 0], ["applied", 500]]
+    assert observed["feedback"] == ["none", 500, "none", 500]
+    assert observed["verifier_exit"] == 2 and observed["findings"] == ["COMMAND_WITHOUT_FEEDBACK"]
+
+    code, observed = run(3, ros_node(), tmp_path)
+    assert code == 0 and observed["feedback"] == [0, 500, 0, 500]
 
 
 @pytest.mark.skipif(False, reason="always runs")

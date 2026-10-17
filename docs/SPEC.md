@@ -394,7 +394,8 @@ numbering. Both are tests.
 **What it does not add.**
 
 - **It is the gate's statement.** It says what the gate sent. It does not show that the
-  actuator obeyed. Anyone who can read the gate's key file can make receipts.
+  actuator obeyed: section 4.6 adds what the actuator's controller then reported. Anyone
+  who can read the gate's key file can make receipts.
 - **Two keys on one machine are still one custodian.** In the demo both key files belong
   to the same user. The separation is between components. It becomes a separation of
   custody only when the gate's key is somewhere the journal's keeper cannot read.
@@ -430,6 +431,125 @@ The planted bugs for this are in the gate. One drops every receipt for a refusal
 it is sent: the robot behaves exactly as it should, and the verifier reports the command
 with no receipt and the gap in the numbering. The other signs no receipts at all, which
 is the gate as it was: the verifier reports every command.
+
+### 4.6 Feedback: what the actuator did after each command
+
+A receipt says what the gate sent to the actuator. It does not say what the actuator then
+did. A command can be sent and still not happen: a wheel slips, a motor stalls, a drive is
+faulted. Until this section the journal could not tell those apart from a command carried
+out.
+
+So the actuator's side reports back. When the configuration names a
+`feedback_public_key`, then after acting on each command record the gate takes into the
+chain (applied, blocked, or refused for its age), the robot reads its controller's own
+account of the actuator (wheel or joint velocities, odometry, joint positions) and signs
+it with a third key, the feedback key. The recorder writes each report into the journal
+as a record of kind `actuator_feedback`.
+
+```
+actuator feedback:
+  "schema":    "sentinel-ledger/actuator-feedback/0"
+  "seq":       the reporter's own count of its reports, from 0, with no gaps. Kept in a
+               state file of its own, so it carries on when the robot restarts
+  "n", "hash": the number and leaf hash of the command record the report follows
+  "sent":      the action the actuator was given for that command, as the gate handed it
+               over: the record's `applied`, or the safe-state action
+  "measured":  what the controller reports the actuator doing, in the same terms and under
+               the same keys as `sent` (for the mobile base: velocities in whole mm/s and
+               mrad/s), or null when the controller reports nothing in those terms
+  "state":     anything else the controller reports, as an object of integers (for the
+               mobile base: the pose from odometry, in whole mm and mrad), or null. At
+               least one of `measured` and `state` is not null
+  "after_ms":  how long after the action was given the reading was taken, in whole
+               milliseconds on the monotonic clock, or null
+  "at_ms":     the robot's wall clock at the reading, whole milliseconds since 1970, or null
+  "sig":       Ed25519 signature, with the feedback key, over the canonical form
+               (section 7.1) of every other field, as 128 hexadecimal characters
+```
+
+**When the reading is taken.** After the action has been given, and before the actuator
+is given anything else, whatever the cause: the next command, a refusal, a deadman trip,
+a safe-state message. A reading taken after the next action would describe that action
+and be filed under the wrong command. The simulated robot takes it on its first motion
+step at least one step (50 ms) after the action, or at once if something else is about
+to be sent first. In that case the numbers are read before the new action and signed
+after it: signing and saving the reporter's number take time, and the new action may be
+a stop, which nothing on the robot's side may delay. A refusal, a deadman trip and a
+safe-state message answer no command record, and no report follows them.
+
+**The feedback key** is neither the recorder's nor the gate's. Its public half is
+`feedback_public_key` in the machine's configuration, 64 hexadecimal characters, copied
+into the first record's `settings` like the gate's. The private half is a file on the
+robot's side that the recorder is never given. A receipt is the gate's statement about
+what it sent; a report is the controller's statement about what the actuator did. Kept
+apart, the second key can move to the component that measures, a motor controller for
+example, without the gate's key going with it. Changing the key is not supported. A
+configuration with no `feedback_public_key` means no reports: none is made, none is
+taken, none is expected. Feedback does not need receipts, and receipts do not need
+feedback.
+
+**The recorder** checks the same two things as for a receipt: that the report is signed
+with the configured feedback key, and that its `seq` is higher than that of the last
+report in the journal. It does not judge what the report says. Like every record, the
+`actuator_feedback` record is numbered, chained, signed by the recorder and sent to the
+gate, which takes it into the chain and issues no receipt for it. Before a stop the ROS
+node waits for the reports of commands it has forwarded, as it does for their receipts,
+for at most two seconds.
+
+**The verifier** (section 8) checks each report's signature against the feedback key the
+first record names, and reports:
+
+- every command record no report answers for, where the settings name a feedback key
+  (`COMMAND_WITHOUT_FEEDBACK`);
+- every gap in the reporter's numbering: a report made that the journal does not hold
+  (`FEEDBACK_MISSING`);
+- every report that is malformed, not signed with the feedback key, or numbered at or
+  below an earlier one (`FEEDBACK_INVALID`);
+- every report the feedback key did sign that does not belong to the command it names
+  (`FEEDBACK_MISMATCH`): the record is not an earlier command; the hash is not that
+  record's; the command already has a report; the report comes after the report for a
+  later command; `sent` is neither the record's `applied` nor the safe state, or is not
+  the safe state for a blocked command; the gate's receipt for the same command says the
+  gate sent something else; or the reading was taken after the gate's next action. The
+  last two need receipts. The last compares the report's `at_ms` with the `at_ms` of the
+  gate's next receipt, both read from the robot's clock.
+
+**What this adds.** For each command the journal now holds what was requested, what the
+safety layer applied, what the gate sent (section 4.5), and what the actuator's
+controller said happened next, each signed by the component that said it. With the
+recorder's key alone, a report cannot be changed, moved to another command or removed
+without it showing: the changed or moved report fails the feedback key's signature, and
+a removed one leaves a command without feedback and a gap in the numbering. Tests show
+each, and show the same three done with the feedback key caught by the checks above.
+
+**What it does not add.**
+
+- **It is the controller's statement.** It says what the controller reports. An actuator
+  that fails without its controller noticing is reported as the controller believes it
+  to be. A sensor outside the controller would be a stronger witness. This build has none.
+- **The verifier does not judge whether the actuator obeyed.** It checks that each report
+  is genuine and belongs to its command. Where `measured` differs from `sent` the journal
+  shows it and the verifier does not say so. What counts as obeying (how fast a motor
+  should reach a speed, how much error is normal) depends on the machine, and no
+  tolerance is set. ROS scenario 13 is a robot whose wheels do not turn: the journal
+  holds that, and the verifier exits 0.
+- **One reading per command, at one moment.** What the actuator did later, while the same
+  command stayed in force, is not recorded. A command held for ten seconds has one
+  reading, taken about one control step after it was given.
+- **Three keys on one machine are still one custodian**, as for receipts. In the demo the
+  feedback key and the gate's key are files of the same user, read by the same process.
+- **A report is sent once.** One that does not reach the journal is noticed by the
+  verifier, not recovered. A lost last report shows only as a command without feedback;
+  the numbering shows nothing until a later report follows.
+- **The time check needs one clock.** Here the report's time and the gate's receipt times
+  come from the same process. Where the gate and the controller run on different clocks,
+  a reading taken late could pass, and a timely one could be reported as late.
+- **Cost.** A command is now three records and three flushes to disk: the command, its
+  receipt and its report. The report is signed with the same plain-Python code as the
+  gate's receipts, whose cost section 4.5 gives, in the robot's one thread.
+- **The file demo does not use it.** The five file scenarios' configuration names no
+  feedback key. The command-line recorder takes a report with the operation
+  `actuator_feedback`, and `tests/test_feedback.py` drives it that way.
 
 ## 5. Core rule 2: requested and applied, and which rule acted
 
@@ -573,6 +693,7 @@ common to every record:
   "kind":   "genesis" | "recorder_start" | "recorder_stop" | "command"
             | "intervention_declared" | "intervention_detected" | "heartbeat"
             | "recorder_fault" | "storage_stall" | "anchor_failed" | "gate_receipt"
+            | "actuator_feedback"
   "n":      position in the journal, from 0
   "prev":   hex leaf hash of record n-1, or "" for n = 0
   "at":     recorder clock, UTC, whole seconds, exactly YYYY-MM-DDTHH:MM:SSZ
@@ -581,7 +702,8 @@ common to every record:
 genesis:
   "machine", "state" (section 6.1), "settings": "heartbeat_seconds", "measure_every",
   "recorder_public_key", "safe_state_action", and, when the configuration has them,
-  "gate_deadman_seconds", "gate_max_command_age_ms", "gate_public_key"
+  "gate_deadman_seconds", "gate_max_command_age_ms", "gate_public_key",
+  "feedback_public_key"
 
 command:
   "requested", "applied" (null when blocked), "outcome", "rules_acted",
@@ -625,6 +747,10 @@ anchor_failed:
 gate_receipt:
   "receipt": one receipt from the gate, whole, with the gate's signature (section 4.5).
   The record around it is signed by the recorder like any other.
+
+actuator_feedback:
+  "feedback": one report from the actuator's side, whole, with the feedback key's
+  signature (section 4.6). The record around it is signed by the recorder like any other.
 ```
 
 **Storage stalls.** A record's `at` is taken when the record is built, before it is
@@ -870,13 +996,17 @@ against the witness's anchors alone.
 | `ANCHOR_FAILED` | an `anchor_failed` record: the recorder states that an anchor statement could not be written. The records it would have covered have one piece of outside evidence fewer |
 | `SIGNATURE_MISSING` | a record has no `sig` |
 | `SIGNATURE_INVALID` | a record's `sig` is not a valid signature of its other fields under the key the first record names |
-| `KEY_MISMATCH` | `--public-key` was given and the first record names a different key, or `--gate-public-key` was given and the first record names a different gate key or none |
+| `KEY_MISMATCH` | `--public-key` was given and the first record names a different key, or `--gate-public-key` was given and the first record names a different gate key or none, or `--feedback-public-key` was given and the first record names a different feedback key or none |
 | `GATE_REFUSED` | a `gate_receipt` record whose receipt says `refused`: the gate did not carry something out. Reported with the reason (`age`, `signature`, `chain`, `form`), the gate's own sentence, and, for `age`, the number of the command record refused |
 | `GATE_DEADMAN` | a `gate_receipt` record whose receipt says `deadman`: the gate heard no valid record for its configured time and sent the safe state |
 | `COMMAND_WITHOUT_RECEIPT` | the settings name a gate key, and no receipt in the journal answers for this command record. Reported at the end, with the command's number |
 | `RECEIPT_MISSING` | the gate's receipt numbers skip: it issued receipts the journal does not hold. The first receipt in a journal must be number 0 |
 | `RECEIPT_INVALID` | a `gate_receipt` record that holds no well-formed receipt, or one not signed with the gate key the first record names, or one numbered at or below an earlier one, or the settings name no gate key |
 | `RECEIPT_MISMATCH` | a receipt signed by the gate that does not belong to the record it names: the record is not an earlier command, the hash is not that record's, the command already has a receipt, the receipt says `applied` and `sent` is not the record's `applied`, or it says `blocked` and the record was not |
+| `COMMAND_WITHOUT_FEEDBACK` | the settings name a feedback key, and no report in the journal answers for this command record. Reported at the end, with the command's number |
+| `FEEDBACK_MISSING` | the reporter's numbers skip: it made reports the journal does not hold. The first report in a journal must be number 0 |
+| `FEEDBACK_INVALID` | an `actuator_feedback` record that holds no well-formed report, or one not signed with the feedback key the first record names, or one numbered at or below an earlier one, or the settings name no feedback key |
+| `FEEDBACK_MISMATCH` | a report signed with the feedback key that does not belong to the command it names: the record is not an earlier command, the hash is not that record's, the command already has a report, it comes after the report for a later command, `sent` is neither the record's `applied` nor the safe state (or not the safe state for a blocked command), the gate's receipt for that command says something else was sent, or the reading was taken after the gate's next action (section 4.6) |
 | `DECISION_MISMATCH` | a decision file is present and does not hash to `decision_sha256`, or is not `decision_bytes` long |
 
 `STORAGE_STALL` is a finding and the exit code is 2. The recorder could not record for
@@ -922,6 +1052,11 @@ as asof-gate does, so the same inputs always give the same output.
 - Where the settings name a gate key: that for every command record a holder of the
   gate's private key signed a statement of what the gate did with it, and which of
   those statements were refusals. With `--gate-public-key`, that the key is the machine's.
+- Where the settings name a feedback key: that for every command record a holder of the
+  feedback key signed one report of what the actuator did, filed under that command and
+  in order; with receipts, that it agrees with the receipt on what was sent and was read
+  before the gate's next action. With `--feedback-public-key`, that the key is the
+  machine's.
 - Each command names the state the journal's own interventions put in force.
 - Under a declared ruleset, the recorded outcome is what that ruleset gives for the
   recorded request and the recorded safety inputs.
@@ -932,7 +1067,9 @@ as asof-gate does, so the same inputs always give the same output.
 - That the real safety layer ran the declared ruleset. `REPORTED_MISMATCH` catches a
   disagreement. Agreement does not prove the layer is correct.
 - That the actuator obeyed. A gate receipt says what the gate sent to it, in the gate's
-  own word. Where there are no receipts, not even that the command reached the gate.
+  own word. Where there are no receipts, not even that the command reached the gate. A
+  report (section 4.6) says what the actuator's controller said happened, in its own
+  word, and the verifier does not compare it with what was sent.
 - What the gate decided about a command that has no receipt.
 - That nothing happened outside the recorder.
 
@@ -946,7 +1083,9 @@ caught each is in the README. The gate's planted bugs (no signature check, no de
 age check, receipts for refusals dropped, no receipts) are made by handing the robot a
 copy of the gate with one line changed. A sixth, no check of a record's canonical form
 (section 4.2), is made the same way and run as the file demo's gate program, with no
-robot.
+robot. The feedback reporter's planted bugs (it reports only on commands that were
+applied; it does not keep its number across a restart) are made the same way, with a
+copy of the reporter.
 
 The recorder that forwards before it records is the instructive one. Its journal is a
 clean journal: the verifier given the journal alone finds nothing. It is caught by the
@@ -1323,15 +1462,18 @@ sensor --JSON--> safety_inputs ----^
 | `recorder_status` | `std_msgs/String` | out of the recorder | one JSON reply for each input handled |
 | `gate_events` | `std_msgs/String` | out of the robot | one JSON line for each message the gate judged |
 | `gate_receipts` | `std_msgs/String` | robot to recorder | the gate's signed receipts (section 4.5), one message each |
+| `actuator_feedback` | `std_msgs/String` | robot to recorder | what the wheels did after each command, signed with the feedback key (section 4.6), one message each |
 
 `cmd_vel_out` is reliable and transient local with a history of 1000, so a robot that
 starts after the recorder still receives the chain from its first record.
-`gate_receipts` has the same settings. A recorder that starts after the robot is sent
-the robot's earlier receipts again and writes none of them twice: it takes only a receipt
-numbered above the last one in the journal.
+`gate_receipts` and `actuator_feedback` have the same settings. A recorder that starts
+after the robot is sent the robot's earlier receipts and reports again and writes none of
+them twice: it takes only one numbered above the last of its kind in the journal.
 
 The launch file gives the robot the gate's key file, `robot_private/gate.key`, when the
-configuration names a `gate_public_key`. The recorder node is never given that file.
+configuration names a `gate_public_key`, and the feedback key file,
+`robot_private/feedback.key`, when it names a `feedback_public_key`. The recorder node is
+never given either file.
 
 The recorder node creates no publisher of `Twist`. The robot subscribes to no `Twist`. The
 only thing that sets the robot's velocity is an action the gate hands it.
@@ -1452,7 +1594,7 @@ A gap is a record number the gate did not see. What can pass in each case:
 
 | how the gap arises | unrecorded commands that reach the robot | then |
 |---|---|---|
-| the node records a command and never publishes it (planted bug) | none | the gate refuses every later record; the robot gets only the safe state; the journal is whole and says so: `GATE_REFUSED` for each refusal, `COMMAND_WITHOUT_RECEIPT` for each command not carried out, and `GATE_DEADMAN`, because with every record refused the gate hears no valid one |
+| the node records a command and never publishes it (planted bug) | none | the gate refuses every later record; the robot gets only the safe state; the journal is whole and says so: `GATE_REFUSED` for each refusal, `COMMAND_WITHOUT_RECEIPT` and `COMMAND_WITHOUT_FEEDBACK` for each command not carried out, and `GATE_DEADMAN`, because with every record refused the gate hears no valid one |
 | a message is lost in transit | none | the same |
 | the node publishes before it writes, and the write fails (planted bug) | one, with this recorder | `GATE_HEAD_NOT_IN_JOURNAL`; on restart the gate refuses the recorder |
 | a recorder that ignores failed writes (section 4.2) | any number, until the gate's head is compared with the journal | the same finding |
@@ -1500,13 +1642,16 @@ recorder is running again and is then written down, so the journal shows the gap
   node and the robot run on the same computer in every test (section 4.4).
 - **The age starts at the node's callback.** A Twist has no time stamp of its own. Time a
   message spent queued before the node's code ran is not counted.
-- **Who publishes `gate_receipts`.** Any node can. One that cannot sign with the gate's
-  key gets nothing written. One that replays the gate's own receipts gets nothing
-  written twice.
+- **Who publishes `gate_receipts` and `actuator_feedback`.** Any node can. One that cannot
+  sign with the gate's key, or the feedback key, gets nothing written. One that replays
+  the robot's own receipts or reports gets nothing written twice.
 - **A receipt that arrives when the recorder cannot write** (stopped, in the safe state,
   not running) is lost. The gate sends each once. After scenario 5's fault, a deadman
   trip on a slow machine would leave a gap in the gate's numbering for that reason.
-- **Both key files are on one machine and belong to one user** in every test.
+- **All three key files are on one machine and belong to one user** in every test.
+- **The wheels are simulated.** The robot's report of what its wheels did is the velocity
+  it was given, unless a test switch makes the wheels stuck. A real robot's report comes
+  from its encoders or its odometry, which this build has not read.
 
 ### 15.8 When the disk is slow
 

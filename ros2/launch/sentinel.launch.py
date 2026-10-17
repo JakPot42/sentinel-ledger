@@ -10,8 +10,11 @@ configuration and never sees the private one. It is also given the deadman time 
 a command's age from the configuration (`gate_deadman_seconds`, `gate_max_command_age_ms`),
 when they are there. When the configuration names a `gate_public_key`, the robot is given
 the gate's own signing key, `robot_private/gate.key`, and signs receipts with it; the
-recorder never sees that file. Each process also
-writes its exit code to a file there, because a launch does not hand them back.
+recorder never sees that file. When it names a `feedback_public_key`, the robot is given
+the feedback key, `robot_private/feedback.key`, and signs what its wheels did after each
+command with it, keeping the number of its next report in `robot_side/feedback.state`.
+Each process also writes its exit code to a file there, because a launch does not hand
+them back.
 """
 import json
 import os
@@ -43,6 +46,9 @@ def generate_launch_description():
         deadman += ["--max-command-age-ms", str(config["gate_max_command_age_ms"])]
     if "gate_public_key" in config:
         deadman += ["--gate-key", os.path.join(work, "robot_private", "gate.key")]
+    if "feedback_public_key" in config:
+        deadman += ["--feedback-key", os.path.join(work, "robot_private", "feedback.key"),
+                    "--feedback-state", os.path.join(robot_side, "feedback.state")]
     robot = ExecuteProcess(
         cmd=[sys.executable, os.path.join(here, "sim_robot.py"),
              "--state", os.path.join(robot_side, "gate.state"),

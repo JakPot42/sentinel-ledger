@@ -42,7 +42,10 @@ limit on a command's age (a command that reaches it too long after the recorder 
 it is not carried out). And the gate answers: for every command record, and for every
 message it refuses, it signs a receipt saying what it did, with a key of its own, and the
 recorder writes that receipt into the journal. A command the gate refused is in the
-journal as refused, with the reason.
+journal as refused, with the reason. And the robot reports back: after each command the
+gate takes in, the robot reads what its wheels then did and where odometry puts it, signs
+that with a third key, and the recorder writes it into the journal under the command it
+follows.
 
 Each record holds:
 
@@ -62,7 +65,9 @@ A verifier, written in a different language from the recorder and sharing no cod
 checks the chain, every signature and every anchored root, replays the journal to work
 out what was in force for each command, and recomputes which rule acted. Where the gate
 signs receipts, it reports every refusal, every deadman trip, and every command that no
-receipt answers for.
+receipt answers for. Where the robot signs feedback, it reports every command with no
+report, and every report that is not genuine or is filed under a command it does not
+belong to. It does not judge whether the actuator did what it was told.
 
 The journal is a [LogChain](https://github.com/JakPot42/logchain) version 2 journal,
 unchanged. `docs/SPEC.md` is the full specification, written so that someone can build a
@@ -128,6 +133,13 @@ Read these before relying on anything above.
   statements, and the journal has no findings, unless the verifier is given a root, a
   witness's store or the gate's state that the rewriter could not reach. See the table
   below.
+- **Feedback is the controller's word, and the verifier does not judge it.** The report of
+  what the actuator did is what the robot's controller says, signed with the feedback key.
+  An actuator that fails without its controller noticing is reported as working. The
+  verifier checks that each report is genuine and filed under the right command; it does
+  not compare what the actuator did with what it was told. In the ROS 2 demo the wheels
+  are simulated: they do what they are given unless a test switch makes them stick. One
+  reading is taken per command, about one control step after it was given.
 - **Hashing says nothing about truth or omission.** A journal that was never written, a
   safety input that was wrong, decision data that left something out: none of these is
   detectable from the journal.
@@ -342,6 +354,7 @@ input.
 | 10 | the recorder goes silent for ten seconds while the robot is moving at 0.5 m/s (its process is frozen) | 0 | 0: the deadman stops the robot after four seconds | 2 (`HEARTBEAT_GAP`: nothing the recorder wrote explains the silence; `GATE_DEADMAN`: the gate's receipt for the trip, written once the recorder is back) |
 | 11 | one record takes six seconds to reach the disk (a test build of the node that can be told to do this) | 0 | 2: the deadman stops the robot at four seconds; the command, six seconds old when its record lands, is refused for its age and the robot stays stopped | 2 (`STORAGE_STALL`: the recorder's next record states the stall and its measured length; `GATE_DEADMAN`; `GATE_REFUSED`, reason `age`, naming the record that was refused) |
 | 12 | the folder for anchor statements becomes unwritable | 0: not a fault, every command goes out | 0 | 2 (`ANCHOR_FAILED`: a signed record states each statement that could not be written) |
+| 13 | the wheels do not turn (a test switch in the simulated robot) | 0 | 0: the gate applies both commands | 0: the receipts say `applied`, the feedback says the wheels did not move, and the verifier does not judge between them |
 
 In scenarios 6 to 9 the recorder's own next command is still accepted after the refusals.
 The robot exits 2 in those scenarios because exit 2 means the gate refused something,
@@ -353,8 +366,10 @@ the verifier exits 2 because that is what happened: the recorder could not recor
 time, or lost an anchor, and the journal says so.
 
 Every scenario also checks the receipts the journal ends up holding, in order: one
-`applied` or `blocked` for each command in scenarios 1 to 5 and 12, and the refusals and
-deadman trips in the others.
+`applied` or `blocked` for each command in scenarios 1 to 5, 12 and 13, and the refusals
+and deadman trips in the others. And for each command record, what the report signed with
+the feedback key says the wheels did: the speed the gate sent in every scenario but 13,
+zero in 13.
 
 ### Receipts from the gate
 
@@ -420,21 +435,85 @@ someone who holds the recorder's key and not the gate's rewrites a refusal as `a
 (`RECEIPT_INVALID`), or deletes it and repairs the chain (`COMMAND_WITHOUT_RECEIPT`,
 `RECEIPT_MISSING`); a receipt signed with another key, or sent twice, is not written.
 
-Eight planted bugs on the ROS path. Three are Cargo features of the node. The other five
-are in the gate, which is Python: the test hands the robot a copy of the gate with one
-line changed. A sixth planted bug in the gate, the check of a record's canonical form
+Nine planted bugs on the ROS path. Three are Cargo features of the node. Five are in the
+gate and one in the feedback reporter, which are Python: the test hands the robot a copy
+of the file with one line changed. A sixth planted bug in the gate, the check of a record's canonical form
 removed, needs no robot and is listed under "Planted bugs" above.
 
 | planted bug | scenario | what turns red |
 |---|---|---|
 | the node stops refusing NaN, infinity and over-limit values | 2 | the scenario driver exits 2: seven commands recorded where four were expected |
-| the node records a command and never publishes it | 1 | the robot exits 2: the gate sees a gap and refuses everything after it. No unrecorded command reaches the robot. The verifier exits 2 as well (`GATE_REFUSED`, `COMMAND_WITHOUT_RECEIPT`, `GATE_DEADMAN`): the journal says the commands after the gap were not carried out and that the deadman tripped |
+| the node records a command and never publishes it | 1 | the robot exits 2: the gate sees a gap and refuses everything after it. No unrecorded command reaches the robot. The verifier exits 2 as well (`GATE_REFUSED`, `COMMAND_WITHOUT_RECEIPT`, `COMMAND_WITHOUT_FEEDBACK`, `GATE_DEADMAN`): the journal says the commands after the gap were not carried out and that the deadman tripped |
 | the node publishes before it writes, and the write fails | 5 | the verifier exits 2 (`GATE_HEAD_NOT_IN_JOURNAL`). One unrecorded command reaches the robot, the same bound as the file demo |
 | the gate skips the signature check | 7 | the scenario driver exits 2: the forged record is accepted and the robot moves at the forger's 1500 mm/s. This is what happened before records were signed |
 | the gate has no deadman | 10 | the scenario driver exits 2: the robot keeps moving at 0.5 m/s for the whole ten seconds the recorder is silent. This is what the gate did before it had one |
 | the gate does not check a command's age | 11 | the scenario driver exits 2: stopped by the deadman at four seconds, the robot starts moving again at six on a command six seconds old. This is what the gate did before it had the check. Its receipt for that command says `applied` |
 | the gate drops the receipt for every refusal | 11, 7 | the robot behaves exactly as it should, and the verifier exits 2. Scenario 11: `COMMAND_WITHOUT_RECEIPT` for the command refused for its age, and `RECEIPT_MISSING` for the skipped number. Scenario 7: `RECEIPT_MISSING` only, since the forged record was never one of the recorder's commands |
 | the gate signs no receipts | 3 | the verifier exits 2: `COMMAND_WITHOUT_RECEIPT` for every command. This is the gate as it was before receipts |
+| the feedback reporter reports only on commands that were applied | 3 | the robot moves as before, and the verifier exits 2: `COMMAND_WITHOUT_FEEDBACK` for the two blocked commands, where the wheels were given the safe state |
+
+### Feedback from the actuator
+
+A receipt says what the gate sent to the wheels. It does not say what the wheels then did.
+A motor can stall, a wheel can slip, a drive can be faulted, and the journal would still
+read: requested, applied, sent.
+
+Now the robot reports back. After acting on each command record the gate takes in
+(applied, blocked, or refused for its age), the robot reads what its wheels are doing and
+where odometry puts it, and signs that reading with a third key, the feedback key, whose
+public half is `feedback_public_key` in the machine's configuration. It publishes the
+report on `actuator_feedback`. The recorder checks that the feedback key signed it and that
+it is newer than the last one, and writes it into the journal as a record of its own,
+next to the command it follows. Each report names that command by number and hash, and
+holds what the wheels were given (`sent`), what they did (`measured`, under the same
+keys), the pose (`state`), and when the reading was taken.
+
+The reading is taken after the action has been given and before the wheels are given
+anything else, so it never describes a later command. The simulated robot takes it on its
+first motion step at least 50 ms after the action, or at once if something else is about
+to be sent first.
+
+Scenario 13 makes the wheels stick. The gate applies both commands and its receipts say
+so. The reports say the wheels did not move. Its journal, from one run:
+
+```
+ 2  command            requested 500 mm/s, applied 500
+ 3  gate_receipt       receipt 0: applied, record 2, sent 500
+ 4  actuator_feedback  report 0: record 2, sent 500, measured 0, pose x 0 mm, read 73 ms after
+ 5  command            requested 300 mm/s, applied 300
+ 6  gate_receipt       receipt 1: applied, record 5, sent 300
+ 7  actuator_feedback  report 1: record 5, sent 300, measured 0, pose x 0 mm, read 100 ms after
+```
+
+In scenario 11, the same reports show what the deadman did. The command whose record took
+six seconds to land was refused for its age, and its report reads: sent 0, measured 0,
+pose x 2050 mm, which is where the deadman had stopped the robot.
+
+The verifier exits 0 on that journal, and that is deliberate. It checks that every report
+is genuine and is filed under the command it names. It does not judge whether the robot
+did what it was told: how fast a motor should reach a speed, and how far off is normal,
+depend on the machine, and no tolerance is set. The journal now holds the answer for a
+person, or a later check, to read.
+
+What the verifier reports about feedback:
+
+| finding | when |
+|---|---|
+| `COMMAND_WITHOUT_FEEDBACK` | a command record that no report answers for |
+| `FEEDBACK_MISSING` | the reporter's numbers skip one or more |
+| `FEEDBACK_INVALID` | a report record that is malformed, not signed with the feedback key, or numbered at or below an earlier one |
+| `FEEDBACK_MISMATCH` | a report the feedback key signed that does not belong to the command it names: not an earlier command, not that command's hash, a second report for one command, a report after a later command's, an action that is neither the record's applied command nor the safe state, an action the gate's receipt does not agree with, or a reading taken after the gate's next action |
+
+`tests/test_feedback.py` runs the recorder, the gate and the reporter with no ROS and shows
+each way a report can go wrong being caught: lost by the robot (`COMMAND_WITHOUT_FEEDBACK`,
+and `FEEDBACK_MISSING` once a later report follows); deleted, changed, or moved to another
+command by someone who holds the recorder's key and not the feedback key
+(`FEEDBACK_INVALID`, `COMMAND_WITHOUT_FEEDBACK`); and, signed with the feedback key itself,
+filed under a command it does not belong to in nine different ways (`FEEDBACK_MISMATCH`).
+A robot whose control loop takes each reading only after the next action, and files it
+under the command before, is caught by the time of its readings. The recorder will not
+write a report that the feedback key did not sign, or one it has already written.
+
 
 ### Time spent in the gate
 
@@ -572,11 +651,11 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 209 tests
+python3 -m pytest tests            # with ROS sourced: 192 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
-The second line runs scenarios 1 to 10 and 12 with the journal in RAM. Scenario 11 needs the
+The second line runs scenarios 1 to 10, 12 and 13 with the journal in RAM. Scenario 11 needs the
 test build (`cargo build --features test-slow-flush`, passed with `--slow-flush-node`);
 pytest builds it itself. The last line is the real-disk measurement and always exits 0.
 
@@ -643,7 +722,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 185 tests without ROS 2 (24 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 215 tests without ROS 2 (26 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
@@ -670,6 +749,7 @@ flag.
 | `docs/SPEC.md` | the specification | |
 | `recorder/` | the recorder, on the `logchain` crate | Rust |
 | `gate/actuator_gate.py` | the actuator-side gate; signs receipts when given a key of its own | Python, standard library |
+| `gate/actuator_feedback.py` | on the robot's side beside the gate: signs what the actuator did after each command, with the feedback key | Python, standard library and the gate's signing code |
 | `witness/witness.py` | a witness: stores the roots it is sent and never changes one | Python, standard library |
 | `anchor/anchor_roots.py` | delivers root statements to a witness, or timestamps them (needs openssl) | Python, standard library |
 | `verifier/verify_journal.py` | the verifier | Python, standard library |
@@ -677,12 +757,13 @@ flag.
 | `profiles/` | the EU profile | |
 | `sources/eu/` | the regulation and its corrigendum as retrieved from the Publications Office of the European Union | |
 | `demo/` | the simulated conveyor and the five scenarios; `pure_ed25519.py` lets the tests play a forger | |
-| `ros2/` | the recorder as a ROS 2 node, a simulated robot with the gate inside it, a launch file, twelve scenarios, the real-disk soak, the clock watchdog | Rust, Python |
-| `tests/` | scenarios, planted bugs, tampering, the gate, its deadman and its receipts, anchoring, storage stalls, the profile, export | |
+| `ros2/` | the recorder as a ROS 2 node, a simulated robot with the gate inside it, a launch file, thirteen scenarios, the real-disk soak, the clock watchdog | Rust, Python |
+| `tests/` | scenarios, planted bugs, tampering, the gate, its deadman and its receipts, the actuator's feedback, anchoring, storage stalls, the profile, export | |
 
 The gate, the witness and the verifier import nothing from each other or from the
 recorder, and tests check their import lists. The same holds for the exporter and the export
-checker.
+checker. The feedback reporter uses the gate's signing code, since both are on the robot's
+side, and nothing else of the gate's.
 
 ## Licence
 

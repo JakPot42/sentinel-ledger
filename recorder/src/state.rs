@@ -114,6 +114,10 @@ pub struct Config {
     /// It is the gate's own key, not the recorder's. Absent: the gate signs no receipts
     /// and the recorder takes none.
     pub gate_public_key: Option<String>,
+    /// The Ed25519 public key the actuator's feedback is signed with: the report, after
+    /// each command, of what the actuator's controller says the actuator did. A third
+    /// key, neither the recorder's nor the gate's. Absent: no feedback is taken or expected.
+    pub feedback_public_key: Option<String>,
     pub safe_state_action: Value,
     pub software: Vec<SoftwareEntry>,
 }
@@ -154,6 +158,13 @@ impl Config {
                 Some(k) => match k.as_str() {
                     Some(k) if is_key(k) => Some(k.to_string()),
                     _ => return Err("gate_public_key must be 64 lowercase hexadecimal characters".to_string()),
+                },
+            },
+            feedback_public_key: match v.get("feedback_public_key") {
+                None => None,
+                Some(k) => match k.as_str() {
+                    Some(k) if is_key(k) => Some(k.to_string()),
+                    _ => return Err("feedback_public_key must be 64 lowercase hexadecimal characters".to_string()),
                 },
             },
             anchor_every: v.get("anchor_every").and_then(Value::as_i64).unwrap_or(0),
@@ -200,6 +211,9 @@ impl Config {
         }
         if let Some(key) = &self.gate_public_key {
             settings["gate_public_key"] = json!(key);
+        }
+        if let Some(key) = &self.feedback_public_key {
+            settings["feedback_public_key"] = json!(key);
         }
         settings
     }

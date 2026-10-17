@@ -303,7 +303,7 @@ class Gate:
             return None
         self.tripped = True
         detail = "no valid record for %.3f s; the limit is %d s" % (silent, self.deadman_seconds)
-        return {"accepted": None, "n": None, "send": self.safe_state, "why": "deadman", "reason": None,
+        return {"accepted": None, "n": None, "hash": None, "send": self.safe_state, "why": "deadman", "reason": None,
                 "silent_seconds": round(silent, 3),
                 # Its receipt names the last record the gate had accepted.
                 "receipt": {"decision": "deadman", "reason": None, "detail": detail,
@@ -326,17 +326,18 @@ class Gate:
 
     def handle(self, message, now=None, wall_ms=None):
         """One message in, one decision out:
-        {"accepted": bool, "n": record number or None, "send": action for the actuator or
-        None, "why": why that action is sent, "reason": why the message was refused,
-        "receipt": what a receipt for this decision will say, or None when it gets none}.
+        {"accepted": bool, "n": record number or None, "hash": that record's leaf hash or
+        None, "send": action for the actuator or None, "why": why that action is sent,
+        "reason": why the message was refused, "receipt": what a receipt for this decision
+        will say, or None when it gets none}.
         `now` is a monotonic clock reading, for the deadman; leave it out and there is none.
         `wall_ms` is the wall clock in milliseconds since 1970, for a command's age; leave
         it out and no command is refused for its age."""
         if not isinstance(message, dict):
             message = {}
         if message.get("type") == "safe_state":
-            return {"accepted": True, "n": None, "send": self.safe_state, "why": "recorder_fault", "reason": None,
-                    "receipt": None}
+            return {"accepted": True, "n": None, "hash": None, "send": self.safe_state, "why": "recorder_fault",
+                    "reason": None, "receipt": None}
         record, reason, kind = judge(message, self.state, self.public_key)
         if reason:
             receipt = {"decision": "refused", "reason": kind, "detail": reason, "n": None, "hash": None}
@@ -346,12 +347,13 @@ class Gate:
             # would make a receipt, without end.
             if kind == "chain" and record.get("kind") == "gate_receipt":
                 receipt = None
-            return {"accepted": False, "n": None, "send": self.safe_state, "why": "gate_refused", "reason": reason,
-                    "receipt": receipt}
+            return {"accepted": False, "n": None, "hash": None, "send": self.safe_state, "why": "gate_refused",
+                    "reason": reason, "receipt": receipt}
         self.state["n"], self.state["hash"] = record["n"], message["hash"]
         if now is not None:
             self.last_valid, self.tripped = now, False
-        decision = {"accepted": True, "n": record["n"], "send": None, "why": None, "reason": None, "receipt": None}
+        decision = {"accepted": True, "n": record["n"], "hash": message["hash"], "send": None, "why": None,
+                    "reason": None, "receipt": None}
         if record.get("kind") == "command":
             named = {"n": record["n"], "hash": message["hash"]}
             stale = self.too_old(record, wall_ms)

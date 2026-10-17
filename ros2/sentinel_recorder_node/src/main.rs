@@ -5,6 +5,8 @@
 //!   safety_inputs     std_msgs/String      in   JSON object of integers, e.g. {"light_curtain_clear":1}
 //!   recorder_control  std_msgs/String      in   JSON: {"op":"declare",...} | {"op":"measure"} | {"op":"stop"}
 //!   gate_receipts     std_msgs/String      in   a receipt signed by the gate, written to the journal as a record
+//!   actuator_feedback std_msgs/String      in   what the actuator did after a command, signed with the
+//!                                               feedback key, written to the journal as a record
 //!   cmd_vel_out       std_msgs/String      out  one message per record: its text, number and hash
 //!   recorder_status   std_msgs/String      out  one JSON reply for each input handled
 //!
@@ -38,13 +40,19 @@ struct Shared {
     /// treat a missing input as unsafe.
     inputs: Map<String, Value>,
     handled: u64,
-    /// A stop was asked for while commands were still waiting for the gate's receipt.
-    /// The stop record is written when the last receipt is in, or at this time.
+    /// A stop was asked for while commands were still waiting for the gate's receipt or
+    /// the actuator's feedback. The stop record is written when the last is in, or at
+    /// this time.
     stop_by: Option<Instant>,
 }
 
-/// How long a stop waits for the receipts of commands already forwarded.
+/// How long a stop waits for the receipts and the feedback of commands already forwarded.
 const STOP_WAITS_FOR_RECEIPTS: Duration = Duration::from_secs(2);
+
+/// Command records forwarded and not yet answered: by a receipt, or by feedback.
+fn unanswered(s: &Shared) -> usize {
+    s.recorder.receipts_outstanding() + s.recorder.feedback_outstanding()
+}
 
 /// Write the stop record and say how it went. Returns the reply and the exit code.
 fn stop_now(s: &mut Shared, failed: &Mutex<Vec<(usize, String)>>) -> (Value, i32) {
@@ -54,12 +62,14 @@ fn stop_now(s: &mut Shared, failed: &Mutex<Vec<(usize, String)>>) -> (Value, i32
         s.recorder.anchor_failed(covered, why);
     }
     let without_receipt = s.recorder.receipts_outstanding();
+    let without_feedback = s.recorder.feedback_outstanding();
     if s.recorder.fault.is_some() {
         return (json!({"ok": false, "fault": true, "stopped": true}), 3);
     }
     match s.recorder.stop() {
         Ok((root, entries)) => {
-            (json!({"ok": true, "stopped": true, "root": root, "entries": entries, "commands_without_receipt": without_receipt}), 0)
+            (json!({"ok": true, "stopped": true, "root": root, "entries": entries,
+                    "commands_without_receipt": without_receipt, "commands_without_feedback": without_feedback}), 0)
         }
         Err(e) => (json!({"ok": false, "fault": true, "stopped": true, "error": e}), 3),
     }
@@ -68,7 +78,7 @@ fn stop_now(s: &mut Shared, failed: &Mutex<Vec<(usize, String)>>) -> (Value, i32
 /// Finish a stop that was waiting for receipts, if it need wait no longer.
 fn finish_stop(s: &mut Shared, failed: &Mutex<Vec<(usize, String)>>, stop: &AtomicI32, tell: &dyn Fn(Value)) {
     let Some(by) = s.stop_by else { return };
-    if s.recorder.receipts_outstanding() > 0 && Instant::now() < by && s.recorder.fault.is_none() {
+    if unanswered(s) > 0 && Instant::now() < by && s.recorder.fault.is_none() {
         return;
     }
     let (mut v, code) = stop_now(s, failed);
@@ -332,6 +342,25 @@ fn run() -> Result<i32, String> {
         })
         .map_err(|e| e.to_string())?;
 
+    // What the actuator did after each command (section 4.6), signed with the feedback key.
+    // Taken like a receipt: what is not signed with that key, or is not newer than the last
+    // one written, is not written.
+    let (s, tell, stopping) = (Arc::clone(&shared), say.clone(), Arc::clone(&stop));
+    let failed = Arc::clone(&anchor_failures);
+    let _feedback = node
+        .create_subscription::<Text, _>("actuator_feedback".keep_last(1000).reliable().transient_local(), move |msg: Text| {
+            let mut s = s.lock().unwrap();
+            s.handled += 1;
+            let feedback: Value = serde_json::from_str(&msg.data).unwrap_or(Value::Null);
+            let of = feedback.get("n").cloned().unwrap_or(Value::Null);
+            let mut v = reply(s.recorder.actuator_feedback(&feedback).map(|(n, seq)| json!({"n": n, "seq": seq, "of": of})));
+            v["kind"] = json!("actuator_feedback");
+            v["handled"] = json!(s.handled);
+            tell(v);
+            finish_stop(&mut s, &failed, &stopping, &tell);
+        })
+        .map_err(|e| e.to_string())?;
+
     let (s, tell, stopping, tracing) = (Arc::clone(&shared), say.clone(), Arc::clone(&stop), trace.clone());
     let failed = Arc::clone(&anchor_failures);
     let _control = node
@@ -346,12 +375,16 @@ fn run() -> Result<i32, String> {
                 "declare" => reply(s.recorder.declare(&op).map(|n| json!({"n": n}))),
                 "measure" => reply(s.recorder.measure().map(|_| json!({})).map_err(Fail::Fault)),
                 "stop" => {
-                    if s.recorder.receipts_outstanding() > 0 && s.recorder.fault.is_none() {
-                        // Commands have gone to the gate whose receipts are not back yet.
-                        // Nothing is written after the stop record, so the stop waits for
-                        // them, for a bounded time. The reply is sent when it is done.
+                    if unanswered(&s) > 0 && s.recorder.fault.is_none() {
+                        // Commands have gone to the gate whose receipts or feedback are not
+                        // back yet. Nothing is written after the stop record, so the stop
+                        // waits for them, for a bounded time. The reply is sent when it is done.
                         s.stop_by = Some(Instant::now() + STOP_WAITS_FOR_RECEIPTS);
-                        tracing.line("control", json!({"op": name, "waiting_for_receipts": s.recorder.receipts_outstanding()}));
+                        tracing.line(
+                            "control",
+                            json!({"op": name, "waiting_for_receipts": s.recorder.receipts_outstanding(),
+                                   "waiting_for_feedback": s.recorder.feedback_outstanding()}),
+                        );
                         return;
                     }
                     let (v, code) = stop_now(&mut s, &failed);

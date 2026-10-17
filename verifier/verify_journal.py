@@ -7,7 +7,7 @@ library, so it can be read, audited and run on its own.
 
     verify_journal.py JOURNAL --rulesets DIR [--root HEX] [--witness-store FILE]
                       [--anchors DIR] [--gate-state FILE] [--decisions DIR] [--public-key HEX]
-                      [--gate-public-key HEX]
+                      [--gate-public-key HEX] [--feedback-public-key HEX]
                       [--profile FILE --as-of YYYY-MM-DD] [--json]
     verify_journal.py --receipt FILE --root HEX
 
@@ -16,7 +16,9 @@ Three levels, and it stops at the first one that fails:
      every anchored root it was given and the head the actuator-side gate holds;
   2. the records: position, order, each record's signature, the state in force, which
      rule acted, and the gate's receipts: every refusal, every deadman trip, every
-     command with no receipt and every gap in the gate's numbering is a finding;
+     command with no receipt and every gap in the gate's numbering is a finding; and the
+     actuator's feedback: every command with none, every gap in its numbering, and every
+     report not signed with the feedback key or not belonging to the command it names;
   3. a profile, when one is given: which records it maps to a rule, and retention.
 
 Exit codes: 0 clean, 2 at least one finding, 1 usage or I/O error.
@@ -34,10 +36,11 @@ import sys
 SCHEMA = "sentinel-ledger/record/0"
 RECEIPT_SCHEMA = "sentinel-ledger/receipt/0"
 GATE_RECEIPT_SCHEMA = "sentinel-ledger/gate-receipt/0"
+FEEDBACK_SCHEMA = "sentinel-ledger/actuator-feedback/0"
 PROFILE_SCHEMA = "sentinel-ledger/profile/0"
 KINDS = ("genesis", "recorder_start", "recorder_stop", "command", "intervention_declared",
          "intervention_detected", "heartbeat", "recorder_fault", "storage_stall", "anchor_failed",
-         "gate_receipt")
+         "gate_receipt", "actuator_feedback")
 REFUSAL_REASONS = ("age", "signature", "chain", "form")
 AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -400,8 +403,8 @@ def good_settings(settings):
     return (isinstance(settings, dict) and type(settings.get("heartbeat_seconds")) is int
             and settings["heartbeat_seconds"] > 0 and isinstance(settings.get("recorder_public_key"), str)
             and HEX64.match(settings["recorder_public_key"]) is not None
-            and ("gate_public_key" not in settings or (isinstance(settings["gate_public_key"], str)
-                                                       and HEX64.match(settings["gate_public_key"]) is not None)))
+            and all(name not in settings or (isinstance(settings[name], str) and HEX64.match(settings[name]) is not None)
+                    for name in ("gate_public_key", "feedback_public_key")))
 
 
 def bad_receipt(r):
@@ -446,6 +449,53 @@ def receipt_fits(r, position, records, hashes, receipted):
     return None
 
 
+def bad_feedback(f):
+    """None, or why the object in an actuator_feedback record is not feedback. SPEC 4.6."""
+    if not isinstance(f, dict) or f.get("schema") != FEEDBACK_SCHEMA:
+        return "the record holds no feedback of schema " + FEEDBACK_SCHEMA
+    if type(f.get("seq")) is not int or f["seq"] < 0:
+        return "the feedback has no number"
+    if type(f.get("n")) is not int or not isinstance(f.get("hash"), str):
+        return "the feedback does not name a record"
+    sent, measured, state = f.get("sent"), f.get("measured"), f.get("state")
+    if not isinstance(sent, dict):
+        return "sent must be an object"
+    if measured is not None and (not isinstance(measured, dict) or sorted(measured) != sorted(sent)
+                                 or not all(type(v) is int for v in measured.values())):
+        return "measured must be null, or an object of integers under the same keys as sent"
+    if state is not None and not isinstance(state, dict):
+        return "state must be an object or null"
+    if measured is None and state is None:
+        return "the feedback reports nothing: measured and state are both null"
+    for key in ("after_ms", "at_ms"):
+        if f.get(key) is not None and (type(f[key]) is not int or f[key] < 0):
+            return "%s must be a whole number of milliseconds or null" % key
+    return None
+
+
+def feedback_fits(f, position, records, hashes, fed, safe_state):
+    """None, or why feedback does not belong to the command record it names."""
+    n = f["n"]
+    if n < 0 or n >= position:
+        return "it names record %d, which is not before it in the journal" % n
+    if records[n] is None or records[n]["kind"] != "command":
+        return "it names record %d, which is not a command" % n
+    if hashes[n] != f["hash"]:
+        return "the hash it names is not the hash of record %d" % n
+    if n in fed:
+        return "record %d already has feedback" % n
+    if fed and n < max(fed):
+        return "it comes after the feedback for record %d, a later command" % max(fed)
+    # The actuator was given the record's applied command, or the safe state: for a blocked
+    # command, or for one the gate did not carry out (too old, for example).
+    command = records[n]
+    if command.get("outcome") == "blocked" and f["sent"] != safe_state:
+        return "it says the actuator was given something other than the safe state, for a blocked command"
+    if f["sent"] not in (command.get("applied"), safe_state):
+        return "it says the actuator was given something that is neither the record's applied command nor the safe state"
+    return None
+
+
 def good_stall(rec):
     return (isinstance(rec.get("step"), str) and type(rec.get("of_record")) is int and rec["of_record"] >= 0
             and type(rec.get("stalled_ms")) is int and rec["stalled_ms"] > 0)
@@ -475,23 +525,31 @@ def good_command(rec):
     return None
 
 
-def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_gate_key=None):
+def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_gate_key=None,
+                  expected_feedback_key=None):
     findings = []
     counts = {"records": len(entries), "commands": 0, "unchanged": 0, "changed": 0, "blocked": 0,
               "not_recomputed": 0, "interventions_declared": 0, "interventions_detected": 0,
               "heartbeats": 0, "recorder_faults": 0, "storage_stalls": 0, "anchors_failed": 0,
               "restarts_without_stop": 0, "gate_receipts": 0, "gate_refusals": 0, "gate_deadman_trips": 0,
-              "commands_without_receipt": 0,
+              "commands_without_receipt": 0, "actuator_feedback": 0, "commands_without_feedback": 0,
               "decisions_named": 0, "decisions_checked": 0, "decision_absent": 0, "signatures_checked": 0}
     downtime = []
     records = []
     parsed_rulesets = {}
-    state = settings = key = gate_key = None
+    state = settings = key = gate_key = feedback_key = None
     prev_hash, prev_at, prev_kind = "", None, None
     # The gate's receipts (SPEC 4.5): the leaf hash of every record, the commands recorded
     # while the settings named a gate key, those a receipt has answered for, and the
     # number of the last receipt seen.
     hashes, wants_receipt, receipted, last_seq = [], [], set(), None
+    # The receipts themselves, by the command they answer for and by their number, for
+    # checking the actuator's feedback against them.
+    receipt_for, receipt_numbered = {}, {}
+    # The actuator's feedback (SPEC 4.6): the commands recorded while the settings named a
+    # feedback key, the feedback each one has (by command number: its position and the
+    # feedback), and the number of the last feedback seen.
+    wants_feedback, fed, last_fb_seq = [], {}, None
 
     def add(kind, n, **more):
         findings.append(dict({"finding": kind, "n": n}, **more))
@@ -536,10 +594,14 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_
                 state, settings = json.loads(canonical(rec["state"])), rec["settings"]
                 key = settings["recorder_public_key"]
                 gate_key = settings.get("gate_public_key")
+                feedback_key = settings.get("feedback_public_key")
                 if expected_key is not None and key != expected_key:
                     add("KEY_MISMATCH", position, journal_key=key, expected_key=expected_key)
                 if expected_gate_key is not None and gate_key != expected_gate_key:
                     add("KEY_MISMATCH", position, journal_gate_key=gate_key, expected_gate_key=expected_gate_key)
+                if expected_feedback_key is not None and feedback_key != expected_feedback_key:
+                    add("KEY_MISMATCH", position, journal_feedback_key=feedback_key,
+                        expected_feedback_key=expected_feedback_key)
             else:
                 add("RECORD_MALFORMED", position, reason="genesis lacks a usable state or settings")
         # Every record, the first included, must be signed with the key the first record names.
@@ -584,6 +646,7 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_
                 elif r["seq"] < expected:
                     add("RECEIPT_INVALID", position, reason="receipt %d follows receipt %d" % (r["seq"], last_seq))
                 last_seq = r["seq"] if last_seq is None else max(last_seq, r["seq"])
+                receipt_numbered.setdefault(r["seq"], r)
                 if r["decision"] == "deadman":
                     counts["gate_deadman_trips"] += 1
                     add("GATE_DEADMAN", position, gate_seq=r["seq"], last_record_accepted=r["n"], detail=r["detail"])
@@ -598,6 +661,30 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_
                             add("RECEIPT_MISMATCH", position, of_record=r["n"], reason=misfit)
                         else:
                             receipted.add(r["n"])
+                            receipt_for[r["n"]] = r
+        elif kind == "actuator_feedback":
+            counts["actuator_feedback"] += 1
+            f = rec.get("feedback")
+            problem = bad_feedback(f) or (None if feedback_key is not None else "the settings name no feedback key")
+            if problem:
+                add("FEEDBACK_INVALID", position, reason=problem)
+            elif not signature_ok(f, feedback_key):
+                add("FEEDBACK_INVALID", position, reason="the feedback is not signed with the feedback key")
+            else:
+                # Numbered from 0 like the gate's receipts. A number skipped is a report
+                # the robot made and the journal does not hold.
+                expected = 0 if last_fb_seq is None else last_fb_seq + 1
+                if f["seq"] > expected:
+                    add("FEEDBACK_MISSING", position, missing=f["seq"] - expected, first_missing=expected,
+                        next_in_journal=f["seq"])
+                elif f["seq"] < expected:
+                    add("FEEDBACK_INVALID", position, reason="feedback %d follows feedback %d" % (f["seq"], last_fb_seq))
+                last_fb_seq = f["seq"] if last_fb_seq is None else max(last_fb_seq, f["seq"])
+                misfit = feedback_fits(f, position, records, hashes, fed, (settings or {}).get("safe_state_action"))
+                if misfit:
+                    add("FEEDBACK_MISMATCH", position, of_record=f["n"], reason=misfit)
+                else:
+                    fed[f["n"]] = (position, f)
         elif kind == "storage_stall":
             counts["storage_stalls"] += 1
             if not good_stall(rec):
@@ -631,6 +718,10 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_
                             add("RECORD_MALFORMED", position, reason="a change of the recorder's key; key rotation is not supported")
                         elif good_settings(rec.get("settings")) and rec["settings"].get("gate_public_key") != gate_key:
                             add("RECORD_MALFORMED", position, reason="a change of the gate's key; key rotation is not supported")
+                        elif good_settings(rec.get("settings")) and \
+                                rec["settings"].get("feedback_public_key") != feedback_key:
+                            add("RECORD_MALFORMED", position,
+                                reason="a change of the feedback key; key rotation is not supported")
                         elif good_settings(rec.get("settings")):
                             settings = rec["settings"]
                         else:
@@ -639,6 +730,8 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_
             counts["commands"] += 1
             if gate_key is not None:
                 wants_receipt.append(position)
+            if feedback_key is not None:
+                wants_feedback.append(position)
             problem = good_command(rec)
             if problem:
                 add("RECORD_MALFORMED", position, reason=problem)
@@ -686,6 +779,30 @@ def check_records(entries, rulesets, decisions_dir, expected_key=None, expected_
         if position not in receipted:
             counts["commands_without_receipt"] += 1
             add("COMMAND_WITHOUT_RECEIPT", position)
+    # Where the robot reports what the actuator did, a command with no report is a command
+    # the journal cannot say the actuator answered.
+    for position in wants_feedback:
+        if position not in fed:
+            counts["commands_without_feedback"] += 1
+            add("COMMAND_WITHOUT_FEEDBACK", position)
+    # Where the gate also signed a receipt for the command, the two must agree on what the
+    # actuator was given. And the reading must have been taken before the gate's next
+    # action: both times are the robot's own clock. Taken later, it could describe that
+    # next action and not this command's.
+    for n, (position, f) in sorted(fed.items()):
+        r = receipt_for.get(n)
+        if r is None:
+            continue
+        if r.get("sent") != f["sent"]:
+            add("FEEDBACK_MISMATCH", position, of_record=n,
+                reason="the gate's receipt for record %d says the gate sent something else" % n)
+            continue
+        after = receipt_numbered.get(r["seq"] + 1)
+        if after is not None and type(after.get("at_ms")) is int and type(f.get("at_ms")) is int \
+                and f["at_ms"] > after["at_ms"]:
+            add("FEEDBACK_MISMATCH", position, of_record=n,
+                reason="it was read after the gate's next action (receipt %d), so it may describe that action"
+                       % after["seq"])
     return findings, counts, downtime, records
 
 
@@ -836,6 +953,9 @@ def show(result):
         if c.get("gate_receipts") or c.get("commands_without_receipt"):
             out.append("gate receipts:    %d in the journal: %d refusal(s), %d deadman trip(s); %d command(s) with no receipt"
                        % (c["gate_receipts"], c["gate_refusals"], c["gate_deadman_trips"], c["commands_without_receipt"]))
+        if c.get("actuator_feedback") or c.get("commands_without_feedback"):
+            out.append("actuator feedback: %d report(s) in the journal; %d command(s) with no feedback"
+                       % (c["actuator_feedback"], c["commands_without_feedback"]))
         if c.get("anchors_failed"):
             out.append("anchors:          %d the recorder states it could not write (each is a finding below)"
                        % c["anchors_failed"])
@@ -926,7 +1046,8 @@ def run(args):
     if not findings:
         result["level_reached"] = 2
         findings, result["counts"], result["downtime"], records = check_records(
-            entries, load_rulesets(args.rulesets), args.decisions, args.public_key, args.gate_public_key)
+            entries, load_rulesets(args.rulesets), args.decisions, args.public_key, args.gate_public_key,
+            args.feedback_public_key)
         if not findings and profile is not None:
             result["level_reached"] = 3
             findings, provisions = check_profile(profile, records, args.decisions, as_of)
@@ -948,6 +1069,8 @@ def main(argv=None):
                     "the key the journal names must be this one")
     ap.add_argument("--gate-public-key", help="the gate's public key, from the machine's configuration; "
                     "the gate key the journal names must be this one")
+    ap.add_argument("--feedback-public-key", help="the feedback key, from the machine's configuration; "
+                    "the feedback key the journal names must be this one")
     ap.add_argument("--rulesets", help="directory holding the ruleset files the journal names")
     ap.add_argument("--decisions", help="directory holding decision files, named by their SHA-256")
     ap.add_argument("--profile", help="a profile file to report against (level 3)")
