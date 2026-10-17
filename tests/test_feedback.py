@@ -522,6 +522,57 @@ def test_a_report_that_does_not_belong_to_the_command_it_names_is_a_finding(fed)
         assert code == 2 and len(mine) == 1 and reason in mine[0]["reason"], (change.__name__, report["findings"])
 
 
+def test_a_number_outside_the_journal_is_a_finding_even_without_the_check_that_rules_it_out(fed, tmp_path):
+    """Found by the mutation check of 17 October 2026: with the check that a report names an
+    earlier record removed, the verifier crashed on a report naming a later record, where it
+    should have reported a finding. The record a report or a receipt names is now looked up
+    in a way that cannot fail, whatever the number.
+
+    The journal: the last report names the last record in the journal, and the last receipt
+    a record far past the end, each signed with its own key. The verifier as shipped reports
+    both as naming a record that is not before them. A copy with that check removed, after
+    proving it was there to remove, still exits 2, now because neither names a command."""
+    m = fed()
+    m.command(400)
+    m.command(500)
+    m.stop()
+
+    def point_past(records):
+        report = [r for r in records if r["kind"] == "actuator_feedback"][-1]
+        report["feedback"] = ed.sign_record(FEEDBACK_SEED, dict(report["feedback"], n=len(records) - 1))
+        receipt = [r for r in records if r["kind"] == "gate_receipt"][-1]
+        receipt["receipt"] = ed.sign_record(GATE_SEED, dict(receipt["receipt"], n=10 ** 9))
+    root = forge(m.w, point_past)
+    args = [m.w.journal, "--root", root, "--rulesets", os.path.join(m.w.data, "rulesets"), "--public-key",
+            m.w.public_key, "--json"] + m.keys()
+
+    def run(verifier):
+        done = subprocess.run([sys.executable, verifier] + args, capture_output=True, text=True)
+        assert "Traceback" not in done.stderr, done.stderr
+        report = json.loads(done.stdout)
+        return done.returncode, {(f["finding"], f["reason"].split(", which")[-1]) for f in report["findings"]
+                                 if f["finding"] in ("FEEDBACK_MISMATCH", "RECEIPT_MISMATCH")}
+
+    code, said = run(run_scenarios.VERIFIER)
+    assert code == 2 and said == {("FEEDBACK_MISMATCH", " is not before it in the journal"),
+                                  ("RECEIPT_MISMATCH", " is not before it in the journal")}
+
+    with open(run_scenarios.VERIFIER, encoding="utf-8") as fh:
+        source = fh.read()
+    check = "    if n < 0 or n >= position:\n"
+    assert source.count(check) == 2                                  # one for receipts, one for reports
+    without = tmp_path / "verifier_without_the_check.py"
+    without.write_text(source.replace(check, "    if False:\n"), encoding="utf-8")
+    code, said = run(str(without))
+    assert code == 2 and said == {("FEEDBACK_MISMATCH", " is not a command"), ("RECEIPT_MISMATCH", " is not a command")}
+
+    # And the lookup on its own, for any number.
+    records, hashes = [{"kind": "command"}], ["00" * 32]
+    for n in (-1, 1, 10 ** 9, "0", True, None):
+        assert vj.record_named(records, hashes, n) == (None, None)
+    assert vj.record_named(records, hashes, 0) == (records[0], hashes[0])
+
+
 def test_a_report_put_after_a_later_commands_report_is_a_finding(fed):
     """The second command's report never reached the recorder. It is genuine, signed with
     the feedback key, and names the second command correctly. The recorder will not write

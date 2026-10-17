@@ -430,18 +430,27 @@ def bad_receipt(r):
     return None
 
 
+def record_named(records, hashes, n):
+    """The record numbered n among those read so far, and its leaf hash, or (None, None).
+    Never an index error, whatever n is: the checks that use it must report a finding for a
+    number outside the journal, not depend on an earlier line having ruled it out."""
+    if type(n) is not int or n < 0 or n >= len(records) or n >= len(hashes):
+        return None, None
+    return records[n], hashes[n]
+
+
 def receipt_fits(r, position, records, hashes, receipted):
     """None, or why a receipt that names a command record does not belong to it."""
     n = r["n"]
     if n < 0 or n >= position:
         return "it names record %d, which is not before it in the journal" % n
-    if records[n] is None or records[n]["kind"] != "command":
+    command, named_hash = record_named(records, hashes, n)
+    if command is None or command["kind"] != "command":
         return "it names record %d, which is not a command" % n
-    if hashes[n] != r["hash"]:
+    if named_hash != r["hash"]:
         return "the hash it names is not the hash of record %d" % n
     if n in receipted:
         return "record %d already has a receipt" % n
-    command = records[n]
     if r["decision"] == "applied" and (command.get("outcome") == "blocked" or r.get("sent") != command.get("applied")):
         return "it says the gate applied something other than the record's applied command"
     if r["decision"] == "blocked" and command.get("outcome") != "blocked":
@@ -478,9 +487,10 @@ def feedback_fits(f, position, records, hashes, fed, safe_state):
     n = f["n"]
     if n < 0 or n >= position:
         return "it names record %d, which is not before it in the journal" % n
-    if records[n] is None or records[n]["kind"] != "command":
+    command, named_hash = record_named(records, hashes, n)
+    if command is None or command["kind"] != "command":
         return "it names record %d, which is not a command" % n
-    if hashes[n] != f["hash"]:
+    if named_hash != f["hash"]:
         return "the hash it names is not the hash of record %d" % n
     if n in fed:
         return "record %d already has feedback" % n
@@ -488,7 +498,6 @@ def feedback_fits(f, position, records, hashes, fed, safe_state):
         return "it comes after the feedback for record %d, a later command" % max(fed)
     # The actuator was given the record's applied command, or the safe state: for a blocked
     # command, or for one the gate did not carry out (too old, for example).
-    command = records[n]
     if command.get("outcome") == "blocked" and f["sent"] != safe_state:
         return "it says the actuator was given something other than the safe state, for a blocked command"
     if f["sent"] not in (command.get("applied"), safe_state):
