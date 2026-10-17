@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(REPO, "demo"))
 sys.path.insert(0, os.path.join(REPO, "verifier"))
 sys.path.insert(0, os.path.join(REPO, "gate"))
 sys.path.insert(0, os.path.join(REPO, "ros2"))
+sys.path.insert(0, os.path.join(REPO, "export"))
 
 
 def target_dir(crate_dir, suffix=""):

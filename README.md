@@ -611,6 +611,26 @@ Three more profiles are listed in the specification and not built: California Ve
 38750(c)(1)(G), insurance and billing use, and the 2022 draft ethical black box standard
 (arXiv:2205.06564).
 
+## Exporting to syslog or CEF
+
+A site that watches a SIEM or a syslog server can have the journal there too, without
+losing the means to check it. `export/export_journal.py` writes one RFC 5424 syslog line or
+one CEF event per record, with the record's exact signed text inside the line and an end line
+holding the record count and the Merkle root. `export/check_export.py` reads an exported file
+on its own, with nothing else from this repository, and checks each line against the record
+inside it, the order and the hash chain, every record's signature and every gate receipt's
+signature. The format, and what the checker does not establish, are in `docs/EXPORT.md`.
+
+```
+python export/export_journal.py demo/out/scenario_4/data/logchain.journal --format syslog --out s4.syslog
+python export/check_export.py s4.syslog --public-key KEY --root ROOT
+```
+
+A record altered, dropped, repeated or moved is a finding, and so is a line whose severity or
+event name was changed after export. The end line is in the same file as the records, so
+someone who drops the last record and rewrites the end line leaves a file that is consistent
+with itself; only `--root`, from an anchor or the gate's head, shows that. A test shows both.
+
 ## Run it
 
 The file demo needs Rust (cargo), Python 3 with pytest, and openssl on the PATH for the
@@ -623,7 +643,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 136 tests without ROS 2 (24 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 185 tests without ROS 2 (24 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
@@ -653,14 +673,16 @@ flag.
 | `witness/witness.py` | a witness: stores the roots it is sent and never changes one | Python, standard library |
 | `anchor/anchor_roots.py` | delivers root statements to a witness, or timestamps them (needs openssl) | Python, standard library |
 | `verifier/verify_journal.py` | the verifier | Python, standard library |
+| `export/` | export of a journal to RFC 5424 syslog or CEF, and an offline checker for an exported file (`docs/EXPORT.md`) | Python, standard library |
 | `profiles/` | the EU profile | |
 | `sources/eu/` | the regulation and its corrigendum as retrieved from the Publications Office of the European Union | |
 | `demo/` | the simulated conveyor and the five scenarios; `pure_ed25519.py` lets the tests play a forger | |
 | `ros2/` | the recorder as a ROS 2 node, a simulated robot with the gate inside it, a launch file, twelve scenarios, the real-disk soak, the clock watchdog | Rust, Python |
-| `tests/` | scenarios, planted bugs, tampering, the gate, its deadman and its receipts, anchoring, storage stalls, the profile | |
+| `tests/` | scenarios, planted bugs, tampering, the gate, its deadman and its receipts, anchoring, storage stalls, the profile, export | |
 
 The gate, the witness and the verifier import nothing from each other or from the
-recorder, and tests check their import lists.
+recorder, and tests check their import lists. The same holds for the exporter and the export
+checker.
 
 ## Licence
 
