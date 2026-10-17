@@ -64,8 +64,9 @@ transport). For record `n`:
 | MSG | a UTF-8 byte order mark, then the record text |
 
 `PEN` is an IANA Private Enterprise Number. The default, 32473, is the number RFC 5612
-reserves for documentation. An organisation that ships these logs should use its own with
-`--enterprise-number`. The checker accepts any number.
+reserves for documentation. It is there as an example and is not meant for real logs.
+**Before real use, set your own organisation's number with `--enterprise-number`.** IANA
+assigns these numbers on request. The checker accepts any number.
 
 The record text is canonical JSON with only ASCII characters and no line breaks (SPEC 7.1),
 so it never needs escaping in MSG. Parameter values are escaped as RFC 5424 requires (`"`,

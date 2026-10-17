@@ -4,6 +4,9 @@
     export_journal.py JOURNAL --format syslog|cef [--out FILE] [--hostname NAME]
                       [--facility N] [--enterprise-number N]
 
+The default enterprise number, 32473, is the one RFC 5612 reserves for documentation. Set
+your own with --enterprise-number before real use.
+
 Every record travels whole, as the exact text its leaf hash and signature cover, so the
 exported file can still be checked with export/check_export.py. The format is in
 docs/EXPORT.md. The exporter never reads the clock: the same journal gives the same bytes.
@@ -207,8 +210,9 @@ def main(argv=None):
     ap.add_argument("--hostname", default="-", help="syslog HOSTNAME field (default: the NILVALUE '-')")
     ap.add_argument("--facility", type=int, default=13, help="syslog facility, 0 to 23 (default 13, log audit)")
     ap.add_argument("--enterprise-number", type=int, default=DOC_PEN,
-                    help="IANA Private Enterprise Number for the structured-data IDs "
-                         "(default 32473, reserved for documentation by RFC 5612)")
+                    help="IANA Private Enterprise Number for the structured-data IDs. The default, "
+                         "32473, is reserved for documentation by RFC 5612 and is only an example: "
+                         "set your own organisation's number before real use")
     args = ap.parse_args(argv)
     try:
         text = export(args.journal, args.format, args.hostname, args.facility, args.enterprise_number)
