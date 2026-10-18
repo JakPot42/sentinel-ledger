@@ -133,13 +133,30 @@ Read these before relying on anything above.
   statements, and the journal has no findings, unless the verifier is given a root, a
   witness's store or the gate's state that the rewriter could not reach. See the table
   below.
-- **Feedback is the controller's word, and the verifier does not judge it.** The report of
-  what the actuator did is what the robot's controller says, signed with the feedback key.
-  An actuator that fails without its controller noticing is reported as working. The
-  verifier checks that each report is genuine and filed under the right command; it does
-  not compare what the actuator did with what it was told. In the ROS 2 demo the wheels
-  are simulated: they do what they are given unless a test switch makes them stick. One
-  reading is taken per command, about one control step after it was given.
+- **A feedback report is the controller's word.** It says what the robot's controller
+  reports the actuator did, signed with the feedback key. An actuator that fails without
+  its controller noticing is reported as working. No real encoder or odometry has been
+  read: in the ROS 2 demo the wheels are simulated and do exactly what they are given,
+  unless a test switch makes them stick.
+- **The verifier does not judge whether the actuator obeyed.** It checks that each report
+  is genuine and filed under the right command. Where what was measured differs from what
+  was sent, the journal shows it and the verifier says nothing: scenario 13, whose wheels
+  never turn, exits 0. Judging it needs a tolerance for each machine, and none is set.
+- **One reading per command.** It is taken about one control step after the command was
+  given. What the actuator did later, while the same command stayed in force, is not
+  recorded.
+- **The check for a late reading assumes one clock.** A report read after the gate's next
+  action is a finding, judged by comparing the report's time with the time on the gate's
+  next receipt. In every test both come from one process. On separate clocks, a late
+  reading could pass and a timely one could be reported as late.
+- **Each command is now three records and three flushes to disk:** the command, the
+  gate's receipt and the actuator's report. In the soak of 18 October 2026 (below) the
+  journal was flushed 1,437 times, against 993 on 10 October, when a command was two
+  records. The median flush was 4.1 ms; 57 took over half a second (37 on 10 October)
+  and none reached the 4 second threshold. That is one soak on one disk.
+- **All three keys are files on one machine, owned by one user, in every test.** The
+  recorder's key, the gate's key and the feedback key separate components, not
+  custodians. Anyone who can read the feedback key's file can sign reports.
 - **Hashing says nothing about truth or omission.** A journal that was never written, a
   safety input that was wrong, decision data that left something out: none of these is
   detectable from the journal.
@@ -147,7 +164,8 @@ Read these before relying on anything above.
   that signs what it stores, consistency proofs between roots, journal rotation. FreeTSA has not been called; the timestamp path was tested with a
   throwaway authority made by openssl.
 - The file demo runs on Windows 11 and on Ubuntu 26.04 under WSL 2. The ROS 2 part has
-  run only on Ubuntu 26.04 under WSL 2. No real robot.
+  run only on Ubuntu 26.04 under WSL 2, with ROS 2 Lyrical and rclrs 0.8. No real robot,
+  no second machine, no other ROS distribution.
 
 ### Limits of the ROS 2 version
 
@@ -627,23 +645,28 @@ tests only.** A journal in RAM is gone at power-off. `ros2/soak_real_disk.py` ru
 same scenarios on a real disk and reports flush times, stalls and deadman trips as
 measurements, with no pass or fail.
 
-One soak on the same WSL 2 disk, on the code as it is now, receipts included: ten rounds
-of scenarios 1 to 10 and 12, 110 scenario runs in 782 seconds, 10 October 2026.
-993 journal flushes, median 4.6 ms, the longest 3.33 s. The soak before receipts had 545:
-each command is now two records. 24 took over one second and none went past the 4 second
-threshold, so no `storage_stall` record was written and the verifier reported no stall.
-The limit on a command's age is 1,000 ms. The gate took in 350 command records. It applied
-325, 19 were blocked commands, and it refused 6 for their age and kept the safe state each
-time. Those 6 are why 6 of the 110 scenario runs did not end as the pass/fail run expects.
-The deadman tripped 11 times: ten on purpose in scenario 10, and once in a run of scenario
-1, where the command that followed was then refused for its age. The longest anchor flush
-was 3.75 s and held nothing up. The clock log's largest step was 0.115 s.
+One soak on the same WSL 2 disk, on the code as it is now, receipts and actuator feedback
+included: ten rounds of scenarios 1 to 10, 12 and 13, 120 scenario runs in 948 seconds,
+18 October 2026. 1,437 journal flushes, median 4.1 ms, the longest 2.98 s. The soak of
+10 October, before feedback, had 993, and the one before receipts 545: each command is now
+three records. 57 took over half a second (37 on 10 October) and none went past the 4
+second threshold, so no `storage_stall` record was written and the verifier reported no
+stall. The limit on a command's age is 1,000 ms. The gate took in 370 command records. It
+applied 345, 19 were blocked commands, and it refused 6 for their age and kept the safe
+state each time. Those 6 are why 6 of the 120 scenario runs did not end as the pass/fail
+run expects, one each in scenarios 1, 3, 5, 8, 10 and 13. The deadman tripped 11 times:
+ten on purpose in scenario 10, and once in a run of scenario 1, after a command there had
+been refused for its age. The longest anchor flush was 2.91 s and held nothing up. The
+clock log's largest step was 0.103 s.
 
 All 6 refusals for age and all 11 deadman trips are in those journals as receipts signed
-by the gate, and the verifier, run over the 110 journals, reported every one: 6
-`GATE_REFUSED` with the reason `age`, 11 `GATE_DEADMAN`. No command record was left
-without a receipt and no receipt number was skipped. In the soak before receipts, 8
-refusals for age and one deadman trip nobody planned left no finding at all.
+by the gate, and the verifier, run over each of the 120 journals, reported every one:
+`GATE_REFUSED` in each of the 6 runs with a refusal for age, `GATE_DEADMAN` in each of the
+11 with a trip. No command record was left without a receipt and no receipt number was
+skipped. The robot's controller filed a feedback report for each of the 370 command
+records, and the verifier reported no `COMMAND_WITHOUT_FEEDBACK`, `FEEDBACK_MISSING`,
+`FEEDBACK_INVALID` or `FEEDBACK_MISMATCH`. In the soak before receipts, 8 refusals for age
+and one deadman trip nobody planned left no finding at all.
 
 To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest installed:
 
@@ -651,7 +674,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 192 tests
+python3 -m pytest tests            # with ROS sourced: 242 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
@@ -722,7 +745,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 215 tests without ROS 2 (26 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 216 tests without ROS 2 (26 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:

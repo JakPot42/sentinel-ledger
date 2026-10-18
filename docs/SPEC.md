@@ -1753,23 +1753,24 @@ journal in RAM does not survive power-off, and a flush there proves nothing abou
 a number of rounds and reports flush times, stall records, deadman trips and verifier
 findings as measurements. It has no pass or fail and exits 0 whenever it could run.
 
-One soak, on the disk above, on the code as it is now, receipts included: ten rounds of
-scenarios 1 to 10 and 12, 110 scenario runs in 782 seconds, 10 October 2026.
-`gate_max_command_age_ms` was 1,000.
+One soak, on the disk above, on the code as it is now, receipts and actuator feedback
+included: ten rounds of scenarios 1 to 10, 12 and 13, 120 scenario runs in 948 seconds,
+18 October 2026. `gate_max_command_age_ms` was 1,000.
 
 | | measured |
 |---|---|
-| journal flushes | 993: median 4.6 ms, longest 3.33 s, 37 over 0.5 s, 24 over 1 s, 0 over 4 s |
-| anchor flushes, off the lock | 392: median 3.3 ms, longest 3.75 s, 12 over 0.5 s |
-| records in the 110 journals | 1,243, of which 350 command records and 441 gate receipts |
+| journal flushes | 1,437: median 4.1 ms, longest 2.98 s, 57 over 0.5 s, 0 over 4 s |
+| anchor flushes, off the lock | 494: median 3.4 ms, longest 2.91 s, 19 over 0.5 s |
+| records in the 120 journals | 1,707, of which 370 command records, 461 gate receipts and 370 actuator feedback reports |
 | `storage_stall` records written | 0: no flush left a gap past the threshold |
-| what the gate did with the 350 command records | applied 325, 19 were blocked commands, refused 6 for their age |
-| deadman trips | 11: one in each round from scenario 10, and one in a run of scenario 1, where the next command was then refused for its age |
+| what the gate did with the 370 command records | applied 345, 19 were blocked commands, refused 6 for their age |
+| deadman trips | 11: one in each round from scenario 10, and one in a run of scenario 1, after a command there had been refused for its age |
 | receipts in the journals for those | all 6 refusals for age, all 11 deadman trips |
-| what the verifier reported, run over the 110 journals | `GATE_REFUSED` with reason `age` 6 times, `GATE_DEADMAN` 11 times; no `COMMAND_WITHOUT_RECEIPT`, no `RECEIPT_MISSING`, no `RECEIPT_INVALID`, no `RECEIPT_MISMATCH` |
+| feedback reports | 370, one for each command record |
+| what the verifier reported, run over each of the 120 journals | `GATE_REFUSED` in each of the 6 runs with a refusal for age, `GATE_DEADMAN` in each of the 11 runs with a trip; no `COMMAND_WITHOUT_RECEIPT`, no `RECEIPT_MISSING`, no `RECEIPT_INVALID`, no `RECEIPT_MISMATCH`; no `COMMAND_WITHOUT_FEEDBACK`, no `FEEDBACK_MISSING`, no `FEEDBACK_INVALID`, no `FEEDBACK_MISMATCH` |
 | other verifier findings | only those the scenarios cause on purpose: `HEARTBEAT_GAP` in 5 and 10, `GATE_REFUSED` for the 80 messages another node sent in 6 to 9, `ANCHOR_FAILED` in 12 |
-| scenario runs not as the pass/fail run expects | 6 of 110, each because a command was refused for its age |
-| the clock log | 7,820 lines, largest step 0.115 s |
+| scenario runs not as the pass/fail run expects | 6 of 120, one each in scenarios 1, 3, 5, 8, 10 and 13, each because a command was refused for its age |
+| the clock log | 9,480 lines, largest step 0.103 s |
 
 Ten rounds on one disk on one day. No flush went past the heartbeat threshold in this run,
 so it did not put the stall record to work on a real disk; scenario 11 does that with the
@@ -1778,5 +1779,7 @@ flush of one to three seconds is too short to be a stall and long enough to make
 command late, the gate refused those commands and kept the safe state, and each refusal
 is in the journal and in the verifier's report. The soak before receipts (545 journal
 flushes, 8 refusals for age, one deadman trip nobody planned) left none of those nine
-events in any journal. The number of journal flushes nearly doubled, because each
-command is now two records. This is not a measure of how often that disk stalls.
+events in any journal. The number of journal flushes nearly doubled with receipts, and
+rose by almost half again with feedback (993 in the soak of 10 October, 1,437 here),
+because each command is now three records. This is not a measure of how often that disk
+stalls.
