@@ -18,6 +18,8 @@ What it reports:
   - deadman trips on the robot's side, and commands the gate refused for their age;
   - the gate's receipts as the journals hold them: how many, what they say, and how many
     of the robot's refusals for age and deadman trips have a receipt in the journal;
+  - the actuator's feedback as the journals hold it: how many reports, and how many
+    command records have none;
   - verifier findings per scenario, and how many scenarios were not as the pass/fail
     run expects;
   - the independent clock watchdog (ros2/clock_watchdog.py): its largest step, which says
@@ -78,6 +80,7 @@ def main(argv=None):
 
     rounds, findings, stalls, receipts = [], collections.Counter(), [], collections.Counter()
     deadman_trips = stale_commands = unexpected = scenarios_run = 0
+    commands = reports = unreported = 0
     started = time.monotonic()
     try:
         for number in range(1, args.rounds + 1):
@@ -101,8 +104,13 @@ def main(argv=None):
                 where = os.path.join(out, "ros_scenario_%s" % name)
                 try:
                     with open(os.path.join(where, "data", "logchain.journal"), encoding="utf-8") as fh:
-                        for line in fh:
-                            record = json.loads(json.loads(line)["raw"])
+                        journal = [json.loads(json.loads(line)["raw"]) for line in fh]
+                        reported = {r["feedback"]["n"] for r in journal if r.get("kind") == "actuator_feedback"}
+                        mine = [r["n"] for r in journal if r.get("kind") == "command"]
+                        commands += len(mine)
+                        reports += sum(r.get("kind") == "actuator_feedback" for r in journal)
+                        unreported += sum(n not in reported for n in mine)
+                        for record in journal:
                             if record.get("kind") == "storage_stall":
                                 stalls.append({"round": number, "scenario": int(name), "step": record["step"],
                                                "stalled_ms": record["stalled_ms"]})
@@ -159,6 +167,7 @@ def main(argv=None):
         "waits_between_records_over_threshold": sum(w * 1000 > threshold_ms for w in waits),
         "storage_stall_records": stalls, "deadman_trips": deadman_trips, "stale_commands_refused": stale_commands,
         "gate_receipts_in_the_journals": dict(sorted(receipts.items())),
+        "command_records": commands, "feedback_reports": reports, "commands_without_feedback": unreported,
         "verifier_findings": dict(sorted(findings.items())),
         "scenarios_not_as_the_pass_fail_run_expects": unexpected, "per_round": rounds,
         "watchdog": {"lines": len(clock_rows), "largest_step_s": round(max(clock_steps), 3) if clock_steps else None,
@@ -182,6 +191,7 @@ def main(argv=None):
     print("  the gate's receipts in the journals: %d %s" % (sum(receipts.values()), dict(sorted(receipts.items()))))
     print("    of the %d refusals for age the robot logged, %d have a receipt in a journal; of the %d deadman trips, %d"
           % (stale_commands, receipts["refused:age"], deadman_trips, receipts["deadman"]))
+    print("  command records: %d; actuator feedback reports: %d; commands with none: %d" % (commands, reports, unreported))
     print("  verifier findings (expected every round: HEARTBEAT_GAP in scenarios 5 and 10, GATE_DEADMAN in 10,")
     print("  GATE_REFUSED in 6 to 9, ANCHOR_FAILED in 12; anything else is the disk):")
     for name, count in sorted(findings.items()):
