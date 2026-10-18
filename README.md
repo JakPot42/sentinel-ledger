@@ -572,7 +572,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 160 tests
+python3 -m pytest tests            # with ROS sourced: 209 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
