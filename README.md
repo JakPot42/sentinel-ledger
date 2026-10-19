@@ -742,13 +742,13 @@ verifier does not compare them (SPEC 4.6); the table is there for a person to re
 What the run showed about timing:
 
 - Simulated time ran at 0.84 of real time while the commands were sent (measured from
-  `/clock`; 0.90 in the first run, 0.91 with the simulation running alone). The bridge
-  times its reading on the wall clock, so its one-second wait was about 0.84 s of the
-  robot's own time. The Burger reaches 0.2 m/s in 0.2 s (its acceleration limit is
-  1.0 m/s²), so each reading came after it had reached the speed it was given. A robot that
-  takes longer to respond, or a simulation running much slower (rendering on the CPU, for
-  one), can be read before it has finished responding, and its feedback then shows less
-  than it went on to do. `SUMMARY.md` states the factor for every run.
+  `/clock`; 0.90 in the first run, 0.98 in a later one, 0.91 with the simulation running
+  alone). The bridge times its reading on the wall clock, so its one-second wait was about
+  0.84 s of the robot's own time. The Burger reaches 0.2 m/s in 0.2 s (its acceleration
+  limit is 1.0 m/s²), so each reading came after it had reached the speed it was given. A
+  robot that takes longer to respond, or a simulation running much slower (rendering on the
+  CPU, for one), can be read before it has finished responding, and its feedback then shows
+  less than it went on to do. `SUMMARY.md` states the factor for every run.
 - In a first run, with no wait after the first odometry, the first forward command reached
   the wheels about 0.8 s late, and its reading caught the robot at 134 mm/s, still
   accelerating. Gazebo was publishing odometry before it took commands; hence the three
