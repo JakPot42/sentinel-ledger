@@ -2,20 +2,23 @@
 """A stand-in for a robot simulation, for tests only: a two-wheeled base with no physics.
 
     stand_in_sim.py [--cmd-topic /cmd_vel] [--cmd-type twist|twist_stamped] [--odom-topic /odom]
-                    [--lag 0.2] [--timeout 0.5] [--stuck]
+                    [--lag 0.2] [--timeout 0.5] [--stuck] [--leave-behind FILE]
 
 It takes velocity commands on a topic and publishes nav_msgs/Odometry twenty times a
 second, as Gazebo with a diff drive plugin, or a ros2_control diff_drive_controller, would.
 Its speed follows the command with a first-order lag (`--lag` seconds), so what odometry
 reports after a step is not exactly what was sent. With no command for `--timeout`
 seconds it stops, as diff_drive_controller does after `cmd_vel_timeout`. `--stuck` makes
-it ignore every command.
+it ignore every command. `--leave-behind FILE` starts a child process that ignores SIGINT
+and SIGTERM and writes its pid to FILE, as a simulator's server can outlive the launch that
+started it; the runner must still leave nothing running.
 
 It exists so that ros2/sim_bridge.py and ros2/run_on_your_sim.py can be tested on any
 machine with ROS 2, without a simulator installed. It is not a simulation of anyone's robot.
 """
 import argparse
 import math
+import subprocess
 import sys
 import time
 
@@ -74,7 +77,15 @@ def main(argv=None):
     ap.add_argument("--lag", type=float, default=0.2)
     ap.add_argument("--timeout", type=float, default=0.5)
     ap.add_argument("--stuck", action="store_true")
+    ap.add_argument("--leave-behind", metavar="FILE")
     args, _ = ap.parse_known_args(argv)
+    if args.leave_behind:
+        child = subprocess.Popen([sys.executable, "-c", "import signal, time; "
+                                  "signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                                  "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(args.leave_behind, "w", encoding="utf-8") as fh:
+            fh.write("%d\n" % child.pid)
     rclpy.init()
     node = StandIn(args)
     try:

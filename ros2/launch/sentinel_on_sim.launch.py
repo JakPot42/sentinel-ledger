@@ -58,6 +58,9 @@ def generate_launch_description():
              "--cmd-type", os.environ.get("SL_SIM_CMD_TYPE", "twist"),
              "--odom-topic", os.environ.get("SL_SIM_ODOM_TOPIC", "/odom")] + gate,
         output="screen")
-    simulation = ExecuteProcess(cmd=shlex.split(os.environ["SL_SIM_COMMAND"]), output="screen")
+    # A simulator can take well over launch's default 5 seconds to stop after SIGINT
+    # (Gazebo does); without the longer wait it is left running when the launch ends.
+    simulation = ExecuteProcess(cmd=shlex.split(os.environ["SL_SIM_COMMAND"]), output="screen",
+                                sigterm_timeout="20", sigkill_timeout="10")
     when_done = RegisterEventHandler(OnProcessExit(target_action=bridge, on_exit=[EmitEvent(event=Shutdown())]))
     return LaunchDescription([simulation, recorder, bridge, when_done])

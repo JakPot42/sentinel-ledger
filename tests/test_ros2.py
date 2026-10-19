@@ -434,10 +434,18 @@ def test_a_signed_log_on_a_stand_in_simulation(ros_node, tmp_path):
 def test_twist_stamped_and_a_robot_that_does_not_move_are_in_the_journal_as_odometry_saw_them(ros_node, tmp_path):
     """The other message type, and a simulated robot whose wheels never turn. The gate
     applied every command it should have and says so; the feedback says the robot did not
-    move; the verifier reports nothing, because it does not judge obedience (SPEC 4.6)."""
-    done, run, records, verified = run_on_sim(ros_node, tmp_path, "--cmd-type twist_stamped --stuck",
+    move; the verifier reports nothing, because it does not judge obedience (SPEC 4.6).
+    The simulation also leaves a process behind that ignores SIGINT and SIGTERM, as
+    Gazebo's server can: the runner stops it."""
+    left = tmp_path / "left_behind.pid"
+    done, run, records, verified = run_on_sim(ros_node, tmp_path / "out",
+                                              "--cmd-type twist_stamped --stuck --leave-behind %s" % left,
                                               "--cmd-type", "twist_stamped")
     assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+    assert "still running after its launch ended; it has been stopped" in done.stdout
+    pid = int(left.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
     assert verified["findings"] == []
     reports = [r["feedback"] for r in records if r["kind"] == "actuator_feedback"]
     assert len(reports) == 5

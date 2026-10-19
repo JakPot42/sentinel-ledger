@@ -20,7 +20,7 @@ velocity commands on a topic and publishes odometry). Only two things change:
   time to respond), or at once if the gate passes on another action first.
 
 What this does not do. The robot's command topic is an ordinary topic, so any node can
-publish to it and move the robot without a record (SPEC 15.7, 16.1): this bridge does not
+publish to it and move the robot without a record (SPEC 15.7): this bridge does not
 sit inside the robot. It shows the journal, the receipts and the feedback on the maker's
 model, nothing more. Odometry is the simulation's word, as feedback is the controller's.
 
