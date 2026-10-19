@@ -2,7 +2,7 @@
 """Offline checker for a Sentinel Ledger journal exported as RFC 5424 syslog or CEF.
 
     check_export.py FILE [--format syslog|cef] [--root HEX] [--public-key HEX]
-                    [--gate-public-key HEX] [--json]
+                    [--gate-public-key HEX] [--feedback-public-key HEX] [--json]
 
 Written from docs/EXPORT.md. It imports nothing from this repository, shells out to
 nothing, never reads the clock, and uses only the Python standard library, so it can be
@@ -10,8 +10,9 @@ copied to the machine where an exported file ended up and run there.
 
 It checks what survives export: each line against the record inside it, the order of the
 records and their hash chain, every record's Ed25519 signature, every gate receipt's
-signature, and the end-of-export line. Everything else (rules, state, gaps, anchors) is the
-verifier's job, on the journal itself.
+signature, every actuator feedback report's signature, and the end-of-export line.
+Everything else (rules, state, gaps, anchors, whether a receipt or a report belongs to its
+command) is the verifier's job, on the journal itself.
 
 Exit codes: 0 clean, 2 at least one finding, 1 the file cannot be read at all.
 """
@@ -26,7 +27,7 @@ import sys
 SCHEMA = "sentinel-ledger/record/0"
 KINDS = ("genesis", "recorder_start", "recorder_stop", "command", "intervention_declared",
          "intervention_detected", "heartbeat", "recorder_fault", "storage_stall", "anchor_failed",
-         "gate_receipt")
+         "gate_receipt", "actuator_feedback")
 AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 APP_NAME = "sentinel-ledger"
 CEF_PREFIX = ["0", "Sentinel Ledger", "journal export", "1"]
@@ -43,6 +44,7 @@ PLAIN = {
     "recorder_fault": (3, 8, "recorder fault"),
     "storage_stall": (4, 6, "storage stall"),
     "anchor_failed": (4, 6, "anchor statement lost"),
+    "actuator_feedback": (6, 2, "actuator feedback"),
 }
 COMMAND = {
     "unchanged": (6, 2, "command passed unchanged"),
@@ -460,7 +462,7 @@ def parse_record(raw):
 
 # --- the checks (docs/EXPORT.md section 6) ---------------------------------------------
 
-def check(path, fmt=None, root=None, public_key=None, gate_public_key=None):
+def check(path, fmt=None, root=None, public_key=None, gate_public_key=None, feedback_public_key=None):
     lines = read_lines(path)
     fmt = fmt or detect(lines)
     parse, record_envelope, end_envelope = FORMATS[fmt]
@@ -481,8 +483,9 @@ def check(path, fmt=None, root=None, public_key=None, gate_public_key=None):
 
     # Records, in file order. A line that did not parse holds no record: what follows it
     # is then out of place, and says so below.
-    leaves, prev_hash, key, gate_key = [], "", public_key, gate_public_key
-    counts = {"lines": len(lines), "records": 0, "signatures_checked": 0, "receipts_checked": 0}
+    leaves, prev_hash, key, gate_key, feedback_key = [], "", public_key, gate_public_key, feedback_public_key
+    counts = {"lines": len(lines), "records": 0, "signatures_checked": 0, "receipts_checked": 0,
+              "feedback_checked": 0}
     ends, last_at, last_record_line = [], None, None
     for lineno, line in parsed:
         if line["type"] == "end":
@@ -515,11 +518,16 @@ def check(path, fmt=None, root=None, public_key=None, gate_public_key=None):
             # first record must name the same ones.
             settings = record.get("settings") if isinstance(record.get("settings"), dict) else {}
             named, named_gate = settings.get("recorder_public_key"), settings.get("gate_public_key")
+            named_feedback = settings.get("feedback_public_key")
             key, gate_key = public_key or named, gate_public_key or named_gate
+            feedback_key = feedback_public_key or named_feedback
             if public_key is not None and named != public_key:
                 add("KEY_MISMATCH", line=lineno, journal_key=named, expected_key=public_key)
             if gate_public_key is not None and named_gate != gate_public_key:
                 add("KEY_MISMATCH", line=lineno, journal_gate_key=named_gate, expected_gate_key=gate_public_key)
+            if feedback_public_key is not None and named_feedback != feedback_public_key:
+                add("KEY_MISMATCH", line=lineno, journal_feedback_key=named_feedback,
+                    expected_feedback_key=feedback_public_key)
 
         if key is not None:
             counts["signatures_checked"] += 1
@@ -537,6 +545,18 @@ def check(path, fmt=None, root=None, public_key=None, gate_public_key=None):
             elif not signature_ok(receipt, gate_key):
                 add("RECEIPT_SIGNATURE_INVALID", line=lineno, n=record["n"],
                     reason="the receipt is not signed with the gate's key")
+        if record["kind"] == "actuator_feedback":
+            counts["feedback_checked"] += 1
+            report = record.get("feedback")
+            if not isinstance(report, dict) or "sig" not in report:
+                add("FEEDBACK_SIGNATURE_INVALID", line=lineno, n=record["n"],
+                    reason="the record holds no signed feedback")
+            elif feedback_key is None:
+                add("FEEDBACK_SIGNATURE_INVALID", line=lineno, n=record["n"],
+                    reason="no feedback key is named or given")
+            elif not signature_ok(report, feedback_key):
+                add("FEEDBACK_SIGNATURE_INVALID", line=lineno, n=record["n"],
+                    reason="the feedback is not signed with the feedback key")
 
     top = merkle_root(leaves)
     recomputed = top.hex() if top is not None else None
@@ -569,8 +589,8 @@ def show(result):
     c = result["counts"]
     out = ["format:           %s" % result["format"],
            "lines:            %d, holding %d record(s)" % (c["lines"], c["records"]),
-           "signatures:       %d record(s) checked, %d gate receipt(s) checked" % (c["signatures_checked"],
-                                                                                 c["receipts_checked"]),
+           "signatures:       %d record(s) checked, %d gate receipt(s) checked, %d feedback report(s) checked"
+           % (c["signatures_checked"], c["receipts_checked"], c["feedback_checked"]),
            "root recomputed:  %s" % result["root_recomputed"]]
     if result["root_checked"] is None:
         out.append("root checked:     none given. The end line is in the same file as the records; this run "
@@ -591,9 +611,10 @@ def main(argv=None):
     ap.add_argument("--root", help="Merkle root, hex, from a copy the file's keeper cannot edit")
     ap.add_argument("--public-key", help="the recorder's public key, from the machine's configuration")
     ap.add_argument("--gate-public-key", help="the gate's public key, from the machine's configuration")
+    ap.add_argument("--feedback-public-key", help="the feedback key, from the machine's configuration")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args(argv)
-    for name in ("root", "public_key", "gate_public_key"):
+    for name in ("root", "public_key", "gate_public_key", "feedback_public_key"):
         value = getattr(args, name)
         if value is not None and not HEX64.match(value.lower()):
             print("error: --%s must be 64 hexadecimal characters" % name.replace("_", "-"), file=sys.stderr)
@@ -601,7 +622,8 @@ def main(argv=None):
     try:
         result = check(args.file, args.format, args.root and args.root.lower(),
                        args.public_key and args.public_key.lower(),
-                       args.gate_public_key and args.gate_public_key.lower())
+                       args.gate_public_key and args.gate_public_key.lower(),
+                       args.feedback_public_key and args.feedback_public_key.lower())
     except Unusable as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1

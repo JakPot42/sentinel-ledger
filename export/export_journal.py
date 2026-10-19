@@ -41,6 +41,7 @@ PLAIN = {
     "recorder_fault": (3, 8, "recorder fault"),
     "storage_stall": (4, 6, "storage stall"),
     "anchor_failed": (4, 6, "anchor statement lost"),
+    "actuator_feedback": (6, 2, "actuator feedback"),
 }
 COMMAND = {
     "unchanged": (6, 2, "command passed unchanged"),

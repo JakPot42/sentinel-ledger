@@ -7,6 +7,7 @@ says so in its name. Nothing here uses the network beyond localhost.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,8 @@ pytestmark = pytest.mark.skipif(not HAVE_ROS, reason="no sourced ROS 2 environme
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DRIVER = os.path.join(REPO, "ros2", "run_ros_scenarios.py")
+EXPORTER = os.path.join(REPO, "export", "export_journal.py")
+CHECKER = os.path.join(REPO, "export", "check_export.py")
 # A domain of its own and localhost-only discovery, so nothing else on the machine or
 # the network can take part.
 ENV = dict(os.environ, ROS_DOMAIN_ID="78", ROS_AUTOMATIC_DISCOVERY_RANGE="LOCALHOST")
@@ -343,6 +346,45 @@ def test_planted_bug_reporter_reports_only_commands_that_moved_the_wheels(ros_no
 
     code, observed = run(3, ros_node(), tmp_path)
     assert code == 0 and observed["feedback"] == [0, 500, 0, 500]
+
+
+def test_a_scenario_13_journal_exports_and_checks_clean_and_an_altered_report_is_found(ros_node, tmp_path):
+    """docs/EXPORT.md on a journal from the ROS path: two commands, two receipts and two
+    reports of wheels that never turned. Exported in both formats, it checks clean against
+    the three keys its genesis record names. A report changed in the exported file is found
+    by the feedback key."""
+    code, observed = run(13, ros_node(), tmp_path)
+    assert code == 0 and observed["reports_published"] == 2
+    data = os.path.join(str(tmp_path), "ros_scenario_13", "data")
+    journal = os.path.join(data, "logchain.journal")
+    with open(os.path.join(data, "logchain.state"), encoding="utf-8") as fh:
+        root = json.load(fh)["merkle_root"]
+
+    def check(path):
+        done = subprocess.run([sys.executable, CHECKER, path, "--root", root, "--json"], capture_output=True, text=True)
+        return done.returncode, json.loads(done.stdout)
+
+    for fmt in ("syslog", "cef"):
+        path = os.path.join(str(tmp_path), "scenario_13." + fmt)
+        done = subprocess.run([sys.executable, EXPORTER, journal, "--format", fmt, "--out", path],
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        code, report = check(path)
+        assert (code, report["findings"]) == (0, [])
+        assert (report["counts"]["feedback_checked"], report["counts"]["receipts_checked"]) == (2, 2)
+        with open(path, encoding="utf-8", newline="") as fh:
+            lines = fh.read().splitlines(True)
+        k = next(i for i, line in enumerate(lines) if '"kind":"actuator_feedback"' in line)
+        altered = re.sub(r'"measured":\{"(\w+)":(-?\d+)',
+                         lambda g: '"measured":{"%s":%d' % (g.group(1), int(g.group(2)) + 100), lines[k], count=1)
+        assert altered != lines[k]
+        lines[k] = altered
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("".join(lines))
+        code, report = check(path)
+        assert code == 2
+        assert [(f["n"], f["reason"]) for f in report["findings"] if f["finding"] == "FEEDBACK_SIGNATURE_INVALID"] == \
+            [(k, "the feedback is not signed with the feedback key")]
 
 
 @pytest.mark.skipif(False, reason="always runs")

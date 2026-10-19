@@ -1,9 +1,10 @@
 """Exporting a journal to RFC 5424 syslog and CEF, and checking the exported file offline.
 docs/EXPORT.md.
 
-The journals are the real recorder's (scenario 4, and the recorder with the real gate from
-tests/test_receipts.py), except where a test needs text no recorder would write, which is
-signed here with the demo's pure-Python Ed25519.
+The journals are the real recorder's (scenario 4, the recorder with the real gate from
+tests/test_receipts.py, and the same with the feedback reporter from tests/test_feedback.py),
+except where a test needs text no recorder would write, which is signed here with the
+demo's pure-Python Ed25519. A ROS scenario 13 journal is exported in tests/test_ros2.py.
 """
 import json
 import os
@@ -19,6 +20,7 @@ import export_journal
 import pure_ed25519 as ed
 import run_scenarios
 import verify_journal as vj
+from test_feedback import BLOCKED, FEEDBACK_PUBLIC, FEEDBACK_SEED, FedMachine
 from test_receipts import GATE_PUBLIC, GATE_SEED, Machine
 from test_tamper import forge
 
@@ -145,6 +147,35 @@ def with_receipts(recorder, tmp_path_factory):
     return m
 
 
+def stop_machine(m):
+    if m.proc.poll() is None:
+        m.proc.kill()
+        m.proc.wait()
+
+
+@pytest.fixture(scope="module")
+def with_feedback(recorder, tmp_path_factory):
+    """The recorder, the real gate and the feedback reporter: an applied, a changed, a
+    blocked command, one refused for its age, and one more applied. Each has a report."""
+    m = FedMachine(tmp_path_factory.mktemp("export_feedback"), recorder, age_limit=1000, clock=False)
+    try:
+        m.command(400)
+        m.command(1800)
+        m.command(500, BLOCKED)
+        m.command(600, late_ms=6000)
+        m.command(300)
+        m.stop()
+    finally:
+        stop_machine(m)
+    return m
+
+
+def bump_measured(line):
+    """The line with the first measured value inside a feedback report raised by 100."""
+    return re.sub(r'"measured":\{"(\w+)":(-?\d+)', lambda g: '"measured":{"%s":%d' % (g.group(1), int(g.group(2)) + 100),
+                  line, count=1)
+
+
 @pytest.fixture()
 def exported(scenario4, tmp_path):
     """export(fmt): scenario 4 exported to a fresh file. Returns its path."""
@@ -186,6 +217,112 @@ def test_gate_receipts_are_checked_against_the_gates_key(with_receipts, tmp_path
     assert report["counts"]["receipts_checked"] == len(receipts)
     assert {r["decision"] for r in receipts} == {"applied", "blocked", "refused", "deadman"}
     assert {r["outcome"] for r in held if r["kind"] == "command"} == {"unchanged", "changed", "blocked"}
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_actuator_feedback_exports_and_is_checked_against_the_feedback_key(with_feedback, tmp_path, fmt):
+    """Before the export tools knew the record kind, every report here was RECORD_MALFORMED
+    and its signature went unchecked."""
+    m = with_feedback
+    path = str(tmp_path / ("f." + fmt))
+    export(m.w.journal, fmt, path)
+    held = [json.loads(r) for r in journal_raws(m.w.journal)]
+    reports = [r for r in held if r["kind"] == "actuator_feedback"]
+    assert len(reports) == 5 and reports[0]["feedback"]["sig"]
+    code, report = check(path, "--root", m.root, "--public-key", m.w.public_key, "--gate-public-key", GATE_PUBLIC,
+                         "--feedback-public-key", FEEDBACK_PUBLIC)
+    assert (code, report["findings"]) == (0, [])
+    assert report["counts"]["feedback_checked"] == len(reports)
+    assert report["counts"]["records"] == report["counts"]["signatures_checked"] == len(held)
+    assert exported_raws(path, fmt) == journal_raws(m.w.journal)
+    code, report = check(path)                                     # the keys the genesis record names
+    assert (code, report["findings"], report["counts"]["feedback_checked"]) == (0, [], 5)
+    first = next(i for i, r in enumerate(held) if r["kind"] == "actuator_feedback")
+    if fmt == "syslog":
+        assert lines_of(path)[first].startswith("<110>1 ")          # facility 13, severity 6
+    else:
+        assert lines_of(path)[first].startswith("CEF:0|Sentinel Ledger|journal export|1|actuator_feedback|"
+                                                "actuator feedback|2|externalId=%d " % first)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_an_altered_feedback_report_is_found(with_feedback, tmp_path, fmt):
+    """Someone changes what a report says the actuator did, in the exported file."""
+    m = with_feedback
+    path = str(tmp_path / ("f." + fmt))
+    export(m.w.journal, fmt, path)
+    lines = lines_of(path)
+    k = [i for i, r in enumerate(journal_raws(m.w.journal)) if json.loads(r)["kind"] == "actuator_feedback"][2]
+    altered = bump_measured(lines[k])
+    assert altered != lines[k]
+    lines[k] = altered
+    write_lines(path, lines)
+    code, report = check(path, "--root", m.root, "--feedback-public-key", FEEDBACK_PUBLIC)
+    assert code == 2
+    assert {"FEEDBACK_SIGNATURE_INVALID", "SIGNATURE_INVALID", "ENVELOPE_MISMATCH", "PREV_MISMATCH",
+            "END_MISMATCH", "ROOT_MISMATCH"} <= set(found(report))
+    assert [(f["n"], f["reason"]) for f in report["findings"] if f["finding"] == "FEEDBACK_SIGNATURE_INVALID"] == \
+        [(k, "the feedback is not signed with the feedback key")]
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_a_report_the_keeper_rewrote_and_signed_again_is_found_by_the_feedback_key(recorder, tmp_path, fmt):
+    """The operator changes the last report before export, signs the record again with the
+    recorder's key and repairs every hash. The chain, the record's signature and the end
+    line all agree with the edit; the report inside is no longer one the feedback key signed."""
+    m = FedMachine(tmp_path, recorder)
+    try:
+        m.command(400)
+        m.command(500)
+        m.stop()
+    finally:
+        stop_machine(m)
+
+    def rewrite(records):
+        last = [r for r in records if r["kind"] == "actuator_feedback"][-1]
+        last["feedback"]["measured"] = {"speed_mm_s": 0}
+    root = forge(m.w, rewrite)
+    path = str(tmp_path / ("f." + fmt))
+    export(m.w.journal, fmt, path)
+    code, report = check(path, "--root", root, "--public-key", m.w.public_key, "--feedback-public-key", FEEDBACK_PUBLIC)
+    assert (code, found(report)) == (2, ["FEEDBACK_SIGNATURE_INVALID"])
+    assert report["findings"][0]["reason"] == "the feedback is not signed with the feedback key"
+
+
+def test_the_feedback_key_given_must_be_the_one_the_journal_names(with_feedback, tmp_path):
+    m = with_feedback
+    path = str(tmp_path / "f.syslog")
+    export(m.w.journal, "syslog", path)
+    code, report = check(path, "--feedback-public-key", ed.public_key(OTHER_SEED).hex())
+    assert code == 2 and found(report) == ["FEEDBACK_SIGNATURE_INVALID", "KEY_MISMATCH"]
+    assert sum(f["finding"] == "FEEDBACK_SIGNATURE_INVALID" for f in report["findings"]) == 5
+    code, report = check(path, "--feedback-public-key", "ab")
+    assert code == 1
+
+
+def test_a_report_in_a_journal_that_names_no_feedback_key_is_found(tmp_path):
+    report = ed.sign_record(FEEDBACK_SEED, {"schema": vj.FEEDBACK_SCHEMA, "seq": 0, "n": 2, "hash": "c" * 64,
+                                            "sent": {"speed_mm_s": 400}, "measured": {"speed_mm_s": 400},
+                                            "state": None, "after_ms": 100, "at_ms": None})
+    bodies = awkward_bodies()[:2] + [
+        {"kind": "command", "at": "2026-10-01T08:00:01Z", "outcome": "unchanged"},
+        {"kind": "actuator_feedback", "at": "2026-10-01T08:00:02Z", "feedback": report},
+    ]
+    journal = synthetic_journal(str(tmp_path / "j"), SEED, bodies)
+    path = str(tmp_path / "f.cef")
+    export(journal, "cef", path)
+    code, found_report = check(path, "--public-key", PUBLIC)
+    assert (code, found(found_report)) == (2, ["FEEDBACK_SIGNATURE_INVALID"])
+    assert found_report["findings"][0]["reason"] == "no feedback key is named or given"
+
+
+def test_the_exporter_and_the_checker_know_every_kind_the_verifier_knows():
+    """A record kind the export tools do not know makes every record of it malformed in the
+    checker. This is how actuator_feedback was missed."""
+    assert set(check_export.KINDS) == set(vj.KINDS)
+    for kind in vj.KINDS:
+        record = {"kind": kind, "outcome": "unchanged", "receipt": {"decision": "applied"}}
+        assert export_journal.classify(record) == check_export.classify(record) != (4, 7, "unknown record"), kind
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
@@ -485,7 +622,7 @@ def test_the_exporter_and_the_checker_agree_with_the_document_on_severity_and_na
         doc = fh.read()
     section = doc[doc.index("## 5. Severity and name"):doc.index("## 6.")]
     rows = re.findall(r"^\| (.+?) \| (\d) \| (\d+) \| (.+?) \|$", section, flags=re.M)
-    assert len(rows) == 20
+    assert len(rows) == 21
 
     def record_for(text):
         kinds = re.findall(r"`([a-z_]+)`", text)

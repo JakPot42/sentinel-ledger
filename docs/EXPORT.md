@@ -145,6 +145,7 @@ safe, right or wrong.
 | `gate_receipt`, decision `refused` | 4 | 7 | gate receipt: refused |
 | `gate_receipt`, decision `deadman` | 4 | 7 | gate receipt: deadman |
 | `gate_receipt`, anything else | 4 | 7 | gate receipt: unreadable |
+| `actuator_feedback` | 6 | 2 | actuator feedback |
 | any other kind | 4 | 7 | unknown record |
 | end of export | 5 | 3 | end of export |
 
@@ -153,7 +154,7 @@ was observed, not for whether it was legitimate.
 
 ## 6. What the checker establishes
 
-`check_export.py FILE [--root HEX] [--public-key HEX] [--gate-public-key HEX] [--json]`
+`check_export.py FILE [--root HEX] [--public-key HEX] [--gate-public-key HEX] [--feedback-public-key HEX] [--json]`
 
 In this order, and it reports every finding rather than stopping at the first:
 
@@ -168,7 +169,10 @@ In this order, and it reports every finding rather than stopping at the first:
    `--public-key`, which the genesis record must then name (`KEY_MISMATCH`,
    `SIGNATURE_MISSING`, `SIGNATURE_INVALID`); every receipt inside a `gate_receipt` record
    is signed with the gate key the genesis record names, or with `--gate-public-key`
-   (`RECEIPT_SIGNATURE_INVALID`). With no key at all it says so (`KEY_UNKNOWN`);
+   (`RECEIPT_SIGNATURE_INVALID`); every report inside an `actuator_feedback` record is
+   signed with the feedback key the genesis record names, or with `--feedback-public-key`,
+   which the genesis record must then name (`KEY_MISMATCH`, `FEEDBACK_SIGNATURE_INVALID`).
+   With no recorder key at all it says so (`KEY_UNKNOWN`);
 6. the end: exactly one end line, and it is the last line (`END_MISSING`, `END_REPEATED`,
    `END_NOT_LAST`);
    its count, root and journal name match the records (`END_MISMATCH`); and, with `--root`,
@@ -179,8 +183,13 @@ Exit codes: 0 nothing found, 2 a finding, 1 the file cannot be read at all.
 ## 7. What it does not establish
 
 - Anything the verifier checks beyond the chain and the signatures: the state in force,
-  which rule acted, gaps in the heartbeat, whether a receipt belongs to its command,
-  anchors, decision files, a profile. For those, run the verifier on the journal.
+  which rule acted, gaps in the heartbeat, whether a receipt or a feedback report belongs
+  to its command, whether a receipt or a report is missing from the numbering, whether a
+  reading was taken in time, anchors, decision files, a profile. For those, run the
+  verifier on the journal.
+- Whether the actuator did what it was told. A feedback report that checks is genuine:
+  the feedback key signed it. What it says is the controller's word, and neither the
+  checker nor the verifier compares it with what was sent (SPEC 4.6).
 - That the file holds a whole journal, when the end line was rewritten and no `--root` was
   given (section 2).
 - That an operator who holds the recorder's private key did not re-sign a rewritten journal
