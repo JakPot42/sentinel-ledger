@@ -369,7 +369,7 @@ of kind `gate_receipt` that is signed by the recorder and refused for its place 
 chain gets no receipt. Another node cannot use that to hide anything of its own: it
 cannot sign a record.
 
-**Before a stop** the recorder waits for the receipts of commands it has already
+**Before the recorder stops,** it waits for the receipts of commands it has already
 forwarded, for a bounded time (two seconds in the ROS node), because nothing is written
 after the stop record.
 
@@ -492,9 +492,9 @@ feedback.
 with the configured feedback key, and that its `seq` is higher than that of the last
 report in the journal. It does not judge what the report says. Like every record, the
 `actuator_feedback` record is numbered, chained, signed by the recorder and sent to the
-gate, which takes it into the chain and issues no receipt for it. Before a stop the ROS
-node waits for the reports of commands it has forwarded, as it does for their receipts,
-for at most two seconds.
+gate, which takes it into the chain and issues no receipt for it. Before the node shuts
+down, it waits for the reports of commands it has forwarded, as it does for their
+receipts, for at most two seconds.
 
 **The verifier** (section 8) checks each report's signature against the feedback key the
 first record names, and reports:
