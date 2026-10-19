@@ -195,8 +195,8 @@ class SimRobot(Node):
             self.send_feedback(self.read_wheels())
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Simulated robot with the Sentinel Ledger gate inside it.")
+def make_parser(description="Simulated robot with the Sentinel Ledger gate inside it."):
+    ap = argparse.ArgumentParser(description=description)
     ap.add_argument("--state", required=True, help="where the gate keeps the last accepted number and hash")
     ap.add_argument("--actuator", required=True, help="a log of every action the robot acted on")
     ap.add_argument("--safe-state", required=True, help="the safe-state action, as JSON, set on the robot's side")
@@ -207,12 +207,23 @@ def main(argv=None):
     ap.add_argument("--feedback-key", help="the feedback key file; with it the robot signs what its wheels did")
     ap.add_argument("--feedback-state", help="where the feedback reporter keeps the number of its next report")
     ap.add_argument("--exit-file", help="the exit code is also written here, for a launcher")
+    return ap
+
+
+def main(argv=None):
+    ap = make_parser()
     args, _ = ap.parse_known_args(argv)
+    return run(SimRobot, ap, args)
+
+
+def run(robot_class, ap, args):
+    """Start `robot_class` with `args`, spin it until it is told to shut down, and write
+    its exit code. Shared with ros2/sim_bridge.py."""
     if bool(args.feedback_key) != bool(args.feedback_state):
         ap.error("--feedback-key and --feedback-state go together")
 
     rclpy.init()
-    robot = SimRobot(args)
+    robot = robot_class(args)
     try:
         while rclpy.ok() and not robot.done:
             rclpy.spin_once(robot, timeout_sec=0.1)

@@ -22,6 +22,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DRIVER = os.path.join(REPO, "ros2", "run_ros_scenarios.py")
 EXPORTER = os.path.join(REPO, "export", "export_journal.py")
 CHECKER = os.path.join(REPO, "export", "check_export.py")
+SIM_RUNNER = os.path.join(REPO, "ros2", "run_on_your_sim.py")
+STAND_IN = os.path.join(REPO, "ros2", "stand_in_sim.py")
 # A domain of its own and localhost-only discovery, so nothing else on the machine or
 # the network can take part.
 ENV = dict(os.environ, ROS_DOMAIN_ID="78", ROS_AUTOMATIC_DISCOVERY_RANGE="LOCALHOST")
@@ -385,6 +387,62 @@ def test_a_scenario_13_journal_exports_and_checks_clean_and_an_altered_report_is
         assert code == 2
         assert [(f["n"], f["reason"]) for f in report["findings"] if f["finding"] == "FEEDBACK_SIGNATURE_INVALID"] == \
             [(k, "the feedback is not signed with the feedback key")]
+
+
+# --- a signed log on someone else's simulation (ros2/run_on_your_sim.py) ----------------
+
+def run_on_sim(ros_node, out, sim_args="", *extra):
+    done = subprocess.run([sys.executable, SIM_RUNNER, "--node", ros_node(), "--out", str(out), "--start-timeout",
+                           "60", "--sim", "%s %s %s" % (sys.executable, STAND_IN, sim_args)] + list(extra),
+                          capture_output=True, text=True, env=ENV, timeout=300)
+    run = os.path.join(str(out), "run")
+    with open(os.path.join(run, "data", "logchain.journal"), encoding="utf-8") as fh:
+        records = [json.loads(json.loads(line)["raw"]) for line in fh]
+    with open(os.path.join(run, "verifier_output.json"), encoding="utf-8") as fh:
+        verified = json.load(fh)
+    return done, run, records, verified
+
+
+def test_a_signed_log_on_a_stand_in_simulation(ros_node, tmp_path):
+    """The runner in front of a simulation it knows nothing about: five commands, each a
+    signed record the gate checked before the robot was given anything, a receipt for
+    each, and a feedback report of what the simulation's odometry measured."""
+    done, run, records, verified = run_on_sim(ros_node, tmp_path)
+    assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+    for name in ("verifier_output.txt", "journal.syslog", "export_check.txt", "SUMMARY.md"):
+        assert os.path.getsize(os.path.join(run, name)) > 0, name
+    assert verified["findings"] == []
+    commands = [r for r in records if r["kind"] == "command"]
+    assert [c["outcome"] for c in commands] == ["unchanged", "unchanged", "blocked", "unchanged", "unchanged"]
+    receipts = {r["receipt"]["n"]: r["receipt"]["decision"] for r in records
+                if r["kind"] == "gate_receipt" and r["receipt"]["decision"] != "deadman"}
+    assert [receipts[c["n"]] for c in commands] == ["applied", "applied", "blocked", "applied", "applied"]
+    reports = {r["feedback"]["n"]: r["feedback"] for r in records if r["kind"] == "actuator_feedback"}
+    assert sorted(reports) == [c["n"] for c in commands]
+    forward, turn, blocked = (reports[c["n"]] for c in commands[:3])
+    assert forward["sent"]["linear_x_mm_s"] == 200 and forward["measured"]["linear_x_mm_s"] > 0
+    assert turn["sent"]["angular_z_mrad_s"] == 500 and turn["measured"]["angular_z_mrad_s"] > 0
+    assert blocked["sent"]["linear_x_mm_s"] == 0
+    assert all(set(f["state"]) == {"x_mm", "y_mm", "heading_mrad"} for f in reports.values())
+    with open(os.path.join(run, "export_check.txt"), encoding="utf-8") as fh:
+        assert fh.read().rstrip().endswith("NO FINDINGS")
+    with open(os.path.join(run, "SUMMARY.md"), encoding="utf-8") as fh:
+        summary = fh.read()
+    assert "Verifier exit 0, findings: none." in summary and summary.count("\n| ") == 6
+
+
+def test_twist_stamped_and_a_robot_that_does_not_move_are_in_the_journal_as_odometry_saw_them(ros_node, tmp_path):
+    """The other message type, and a simulated robot whose wheels never turn. The gate
+    applied every command it should have and says so; the feedback says the robot did not
+    move; the verifier reports nothing, because it does not judge obedience (SPEC 4.6)."""
+    done, run, records, verified = run_on_sim(ros_node, tmp_path, "--cmd-type twist_stamped --stuck",
+                                              "--cmd-type", "twist_stamped")
+    assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+    assert verified["findings"] == []
+    reports = [r["feedback"] for r in records if r["kind"] == "actuator_feedback"]
+    assert len(reports) == 5
+    assert any(f["sent"]["linear_x_mm_s"] == 200 for f in reports)
+    assert all(f["measured"]["linear_x_mm_s"] == 0 and f["measured"]["angular_z_mrad_s"] == 0 for f in reports)
 
 
 @pytest.mark.skipif(False, reason="always runs")

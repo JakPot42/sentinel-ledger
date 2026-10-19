@@ -93,6 +93,7 @@ class Session:
     def __init__(self, out, name, node_bin):
         self.node_bin = node_bin
         self.extra_env = {}
+        self.launch_file = LAUNCH   # what `ros2 launch` starts; ros2/run_on_your_sim.py starts another
         self.dir = os.path.join(out, name)
         if os.path.isdir(self.dir):
             for folder, _, files in os.walk(self.dir):
@@ -147,7 +148,7 @@ class Session:
                 os.remove(os.path.join(self.dir, name))
         env = dict(os.environ, SL_WORKDIR=self.dir, SL_NODE_BIN=self.node_bin, **self.extra_env)
         self.log = open(os.path.join(self.dir, "launch-%d.log" % self.runs), "w")
-        self.proc = subprocess.Popen(["ros2", "launch", LAUNCH], env=env, stdout=self.log,
+        self.proc = subprocess.Popen(["ros2", "launch", self.launch_file], env=env, stdout=self.log,
                                      stderr=subprocess.STDOUT, start_new_session=True)
         SERIAL[0] += 1
         self.node = rclpy.create_node("sl_scenario_driver_%d" % SERIAL[0])
@@ -299,12 +300,16 @@ class Session:
         with open(os.path.join(self.data, "logchain.state"), encoding="utf-8") as fh:
             return json.load(fh)["merkle_root"]
 
+    def keys(self):
+        """The keys the verifier is given: the feedback key only where this robot has one."""
+        given = ["--public-key", self.public_key, "--gate-public-key", self.gate_public_key]
+        return given + (["--feedback-public-key", self.feedback_public_key] if self.feedback_public_key else [])
+
     def verify(self, root=None):
         done = subprocess.run(
             [sys.executable, VERIFIER, self.journal, "--root", str(root or self.state_root()),
-             "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state,
-             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key,
-             "--feedback-public-key", self.feedback_public_key, "--json"],
+             "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state]
+            + self.keys() + ["--json"],
             capture_output=True, text=True)
         try:
             return done.returncode, json.loads(done.stdout)
@@ -315,9 +320,8 @@ class Session:
         """The verifier's report as a person reads it. Also kept in the scenario's folder."""
         done = subprocess.run(
             [sys.executable, VERIFIER, self.journal, "--root", str(root or self.state_root()),
-             "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state,
-             "--public-key", self.public_key, "--gate-public-key", self.gate_public_key,
-             "--feedback-public-key", self.feedback_public_key],
+             "--rulesets", os.path.join(self.data, "rulesets"), "--gate-state", self.gate_state]
+            + self.keys(),
             capture_output=True, text=True)
         with open(os.path.join(self.dir, "verifier_output.txt"), "w", encoding="utf-8") as fh:
             fh.write(done.stdout)
