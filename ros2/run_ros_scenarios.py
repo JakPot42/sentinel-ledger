@@ -630,7 +630,12 @@ def scenario_10(s):
     pose_x = s.robot_exit_file()["pose"][0]
     obs.update(sent=s.sent(), deadman_trips=len(trips),
                # Twenty checks a second: the trip comes within a few tenths of the limit.
-               tripped_in_time=silent is not None and DEADMAN_SECONDS < silent <= DEADMAN_SECONDS + 0.5,
+               # The gate trips only when the silence is over the limit, and states it to
+               # the millisecond, so a trip in the first half millisecond is stated as the
+               # limit itself. That is in time. Reading the rounded figure, this check
+               # would also pass a trip up to half a millisecond early; the gate's own
+               # comparison, on the unrounded figure, does not allow one.
+               tripped_in_time=silent is not None and DEADMAN_SECONDS <= silent <= DEADMAN_SECONDS + 0.5,
                # At 0.5 m/s for the whole ten seconds the robot would be past 5 m. Stopped
                # by the deadman it has covered about 2.5 m, then some more at 0.3 m/s.
                robot_stopped_short=pose_x < 4.0,

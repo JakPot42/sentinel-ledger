@@ -204,9 +204,10 @@ What it does not cover:
   separate two components, not two custodians. Kept where the journal's keeper cannot
   read it, the gate's key would make a refusal something the keeper cannot remove or
   rewrite unseen. That has not been set up or tested.
-- **Receipts double the writes.** A command is now two records and two flushes to disk.
-  Every message the gate refuses costs it a signature and the journal a record, and
-  nothing limits how fast another node can cause them.
+- **Receipts double the writes.** With receipts a command is two records and two flushes
+  to disk, and with feedback three (see the known limits above). Every message the gate
+  refuses costs it a signature and the journal a record, and nothing limits how fast
+  another node can cause them.
 - **The gate's signature work runs in the robot's one thread.** On an idle machine it
   takes about 4 ms to check a record's signature and about 4 ms to sign a receipt, and
   about three times that with every processor busy. The deadman check and the motion
@@ -219,6 +220,16 @@ What it does not cover:
   thread and checks twenty times a second. Anything slow on the robot's side delays the
   check. In a real controller the deadman belongs on a timer of its own. The file demo's
   gate reads a file after the fact and has no deadman.
+- **One deadman test failed once, and why is not known.** On 18 October 2026, in a full
+  Linux run, `test_planted_bug_gate_has_no_deadman` failed in its second half: with the
+  real gate, scenario 10 did not end as expected. Rerun alone it passed, as it did in the
+  other runs that day, and its files were gone before anyone looked. Two causes fit. The
+  scenario's check asked for a trip after more than four seconds, while the gate states
+  the silence to the millisecond, so a correct trip a fraction of a millisecond after four
+  seconds read as 4.000 and failed it; the check now accepts 4.000. Or the command after
+  the trip reached the gate more than a second old and was refused for its age, which a
+  loaded machine can cause: the soak that day had it once in ten runs of scenario 10. That
+  second cause can still turn any run judged on timing red.
 - **The deadman watches the recorder, not the controller.** It trips when the gate has
   accepted no record for `gate_deadman_seconds`, and heartbeat records count. If the
   controller dies or hangs while the recorder keeps writing heartbeats, the robot keeps
@@ -674,7 +685,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 242 tests
+python3 -m pytest tests            # with ROS sourced: 252 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
@@ -745,7 +756,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 216 tests without ROS 2 (26 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 225 tests without ROS 2 (27 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
