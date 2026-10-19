@@ -685,7 +685,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 252 tests
+python3 -m pytest tests            # with ROS sourced: 259 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
@@ -696,6 +696,81 @@ pytest builds it itself. The last line is the real-disk measurement and always e
 Two diagnostic aids are off unless asked for: set `SL_TRACE_FILE` and the node logs how
 long each write took and how long each thread waited, against the monotonic clock;
 `ros2/clock_watchdog.py` is the independent clock log used above.
+
+### A signed log on your simulation
+
+`ros2/run_on_your_sim.py` puts the recorder and the gate in front of a ROS 2 robot
+simulation that someone else built, so a robot maker can see the signed journal and the
+verifier's report on their own robot model. It starts three processes: the simulation
+(whatever command is given with `--sim`), the recorder node, and `ros2/sim_bridge.py`,
+which is the same gate, receipts and feedback reporter as the simulated robot above,
+standing between the recorder and the simulation's velocity command topic
+(`geometry_msgs/Twist` or `TwistStamped`). The runner plays the controller and the safety
+sensor. Once the robot publishes odometry and three more seconds have passed, it sends
+five commands: forward, turn on the spot, forward with the light curtain interrupted,
+forward more slowly, stop. After each one, once the action has been in force for one
+second, the bridge reads the simulation's odometry and signs it as the actuator's feedback.
+
+**Here the gate sits in front of the robot's command topic, not inside the robot.** Any
+other program that publishes to that topic moves the robot, and nothing of it is in the
+journal. In the simulated robot above the gate is the only way to the wheels; a simulation
+built by someone else has its own way in, the plain velocity topic that SPEC 15.7 names as
+a limit. What this shows is the journal, the receipts and the feedback on your model, not
+a protected robot.
+
+Measured on a TurtleBot3 Burger (ROBOTIS, `turtlebot3_gazebo` 2.3.7 on ROS 2 Lyrical,
+Gazebo's empty world with no window, WSL 2), 19 October 2026:
+
+```
+python3 ros2/run_on_your_sim.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node \
+    --sim "ros2 launch ros2/examples/turtlebot3_headless.launch.py" --env TURTLEBOT3_MODEL=burger \
+    --cmd-type twist_stamped
+```
+
+| record | asked for (mm/s, mrad/s) | the record's outcome | the gate's receipt | the robot was given | odometry measured, and how long after |
+|---|---|---|---|---|---|
+| 15 | (200, 0) | unchanged | applied | (200, 0) | (200, 0), 1021 ms |
+| 19 | (0, 500) | unchanged | applied | (0, 500) | (0, 500), 1012 ms |
+| 23 | (200, 0) | blocked | blocked | (0, 0) | (0, 0), 1017 ms |
+| 27 | (100, 0) | unchanged | applied | (100, 0) | (100, 0), 1043 ms |
+| 31 | (0, 0) | unchanged | applied | (0, 0) | (0, 0), 1044 ms |
+
+The recorder, the bridge, the verifier and the offline check of the syslog export all
+exited 0, with no findings. In this run the last two columns agree for every command. The
+verifier does not compare them (SPEC 4.6); the table is there for a person to read.
+
+What the run showed about timing:
+
+- Simulated time ran at 0.84 of real time while the commands were sent (measured from
+  `/clock`; 0.90 in the first run, 0.91 with the simulation running alone). The bridge
+  times its reading on the wall clock, so its one-second wait was about 0.84 s of the
+  robot's own time. The Burger reaches 0.2 m/s in 0.2 s (its acceleration limit is
+  1.0 m/s²), so each reading came after it had reached the speed it was given. A robot that
+  takes longer to respond, or a simulation running much slower (rendering on the CPU, for
+  one), can be read before it has finished responding, and its feedback then shows less
+  than it went on to do. `SUMMARY.md` states the factor for every run.
+- In a first run, with no wait after the first odometry, the first forward command reached
+  the wheels about 0.8 s late, and its reading caught the robot at 134 mm/s, still
+  accelerating. Gazebo was publishing odometry before it took commands; hence the three
+  seconds (`--settle`).
+- TurtleBot3's own `empty_world.launch.py` always opens Gazebo's window.
+  `ros2/examples/turtlebot3_headless.launch.py` starts the same world and robot without
+  it, through ROBOTIS's own launch files for the robot. Gazebo's server takes longer to stop
+  than its launch waits, and after the first run it was still running. The runner now stops
+  anything of the simulation that is still running when it is done.
+
+Each run leaves, in one folder: the journal (`data/logchain.journal`), the verifier's
+report as text and as JSON, the journal exported as RFC 5424 syslog with the offline
+checker's report on it, and `SUMMARY.md` with the table above.
+
+For another robot: give `--sim` the command that starts its simulation; `--cmd-topic`,
+`--cmd-type` and `--odom-topic` where they differ from `/cmd_vel`, `twist` and `/odom`;
+and `--env` for any variable it needs. It should work with any simulator that takes velocity
+commands on a topic and publishes `nav_msgs/Odometry`, but only the Burger has been tried.
+In the tests, `ros2/stand_in_sim.py` stands in for a simulation (a two-wheeled base with a
+lag and no physics), so the runner is tested without a simulator: with `Twist`, and with
+`TwistStamped`, wheels that never turn and a process left behind that ignores SIGINT and
+SIGTERM.
 
 ## The EU Machinery Regulation profile
 
@@ -756,7 +831,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 225 tests without ROS 2 (27 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 230 tests without ROS 2 (29 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
@@ -791,7 +866,7 @@ flag.
 | `profiles/` | the EU profile | |
 | `sources/eu/` | the regulation and its corrigendum as retrieved from the Publications Office of the European Union | |
 | `demo/` | the simulated conveyor and the five scenarios; `pure_ed25519.py` lets the tests play a forger | |
-| `ros2/` | the recorder as a ROS 2 node, a simulated robot with the gate inside it, a launch file, thirteen scenarios, the real-disk soak, the clock watchdog | Rust, Python |
+| `ros2/` | the recorder as a ROS 2 node, a simulated robot with the gate inside it, a launch file, thirteen scenarios, the real-disk soak, the clock watchdog; the gate in front of another simulation's command topic (`sim_bridge.py`), the runner for it (`run_on_your_sim.py`), a stand-in simulation for its tests and a headless TurtleBot3 launch (`examples/`) | Rust, Python |
 | `tests/` | scenarios, planted bugs, tampering, the gate, its deadman and its receipts, the actuator's feedback, anchoring, storage stalls, the profile, export | |
 
 The gate, the witness and the verifier import nothing from each other or from the
