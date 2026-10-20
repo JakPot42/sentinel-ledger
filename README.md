@@ -685,7 +685,7 @@ To run it, on Ubuntu 26.04 with ROS 2 Lyrical, Rust, `libclang-dev` and pytest i
 . /opt/ros/lyrical/setup.sh
 cd ros2/sentinel_recorder_node && cargo build && cd ../..
 python3 ros2/run_ros_scenarios.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
-python3 -m pytest tests            # with ROS sourced: 264 tests
+python3 -m pytest tests            # with ROS sourced: 274 tests
 python3 ros2/soak_real_disk.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node
 ```
 
@@ -706,14 +706,18 @@ verifier's report on their own robot model. It starts three processes: the simul
 which is the same gate, receipts and feedback reporter as the simulated robot above,
 standing between the recorder and the simulation's velocity command topic
 (`geometry_msgs/Twist` or `TwistStamped`). The runner plays the controller and the safety
-sensor. Once the robot publishes odometry and three more seconds have passed, it sends
-five commands: forward, turn on the spot, forward with the light curtain interrupted,
-forward more slowly, stop. After each one, once the action has been in force for one
-second of the simulation's own time (its `/clock`), the bridge reads the simulation's
-odometry and signs it as the actuator's feedback. If that clock has not advanced a second
-within five seconds of wall time, the bridge reads the odometry then anyway. A simulation
-that publishes no `/clock` is read after one second of wall time, and `--read-clock wall`
-asks for that on purpose.
+sensor. It waits until the robot's odometry has been arriving steadily for two seconds
+(`--steady`): no gap of more than half a second between messages, and the time stamps in
+them advancing at a rate above zero that is the same, within 25%, in both halves of those
+two seconds. Then it sends five commands: forward, turn on the spot, forward with the
+light curtain interrupted, forward more slowly, stop. After each one, once the action has
+been in force for one second of the robot's own time, as the odometry's time stamps count
+it, the bridge reads the odometry and signs it as the actuator's feedback. If the stamps
+have not advanced a second within five seconds of wall time, the bridge reads the odometry
+then anyway. Odometry stamped zero is read after one second of wall time, and
+`--read-clock wall` asks for that on purpose. If the odometry has not arrived steadily
+within 60 seconds (`--steady-timeout`), the runner sends no command, stops everything it
+started and exits 1.
 
 **Here the gate sits in front of the robot's command topic, not inside the robot.** Any
 other program that publishes to that topic moves the robot, and nothing of it is in the
@@ -723,7 +727,8 @@ a limit. What this shows is the journal, the receipts and the feedback on your m
 a protected robot.
 
 Measured on a TurtleBot3 Burger (ROBOTIS, `turtlebot3_gazebo` 2.3.7 on ROS 2 Lyrical,
-Gazebo's empty world with no window, WSL 2), 20 October 2026:
+Gazebo's empty world with no window, WSL 2), 20 October 2026, starting with nothing of
+Gazebo's running:
 
 ```
 python3 ros2/run_on_your_sim.py --node ros2/sentinel_recorder_node/target/debug/sentinel_recorder_node \
@@ -733,58 +738,80 @@ python3 ros2/run_on_your_sim.py --node ros2/sentinel_recorder_node/target/debug/
 
 | record | asked for (mm/s, mrad/s) | the record's outcome | the gate's receipt | the robot was given | odometry measured, and how long after |
 |---|---|---|---|---|---|
-| 6 | (200, 0) | unchanged | refused: age | (0, 0) | (0, 0), 5218 ms (0.00 s simulated) |
-| 12 | (0, 500) | unchanged | applied | (0, 500) | (0, 500), 1061 ms (1.04 s simulated) |
-| 16 | (200, 0) | blocked | blocked | (0, 0) | (0, 0), 1039 ms (1.03 s simulated) |
-| 20 | (100, 0) | unchanged | applied | (100, 0) | (100, 0), 1032 ms (1.01 s simulated) |
-| 24 | (0, 0) | unchanged | applied | (0, 0) | (0, 0), 1033 ms (1.00 s simulated) |
+| 25 | (200, 0) | unchanged | applied | (200, 0) | (200, 0), 1074 ms (1.02 s simulated) |
+| 29 | (0, 500) | unchanged | applied | (0, 500) | (0, 500), 1298 ms (0.99 s simulated) |
+| 33 | (200, 0) | blocked | blocked | (0, 0) | (0, 0), 1138 ms (1.02 s simulated) |
+| 37 | (100, 0) | unchanged | applied | (100, 0) | (100, 0), 1036 ms (0.99 s simulated) |
+| 41 | (0, 0) | unchanged | applied | (0, 0) | (0, 0), 1012 ms (0.99 s simulated) |
 
-The journal is complete, the verifier checked all 29 records and their signatures, and
-the offline check of the syslog export passed. The bridge exited 2 and the verifier
-reported one finding, `GATE_REFUSED`: the first command reached the gate 1,544 ms after
-the recorder received it, over the 1,000 ms limit, so the gate refused it, kept the robot
-still and signed a receipt saying so. For the other four commands the last two columns
-agree. The verifier does not compare them (SPEC 4.6); the table is there for a person to
-read.
+The journal is complete: the verifier checked all 46 records and their signatures and
+reported no findings, and the offline check of the syslog export passed. The gate applied
+four commands and blocked the third, as the light curtain asked, and for all five the last
+two columns agree. The verifier does not compare them (SPEC 4.6); the table is there for a
+person to read. The recorder and the bridge both exited 0, as launch's own log states it.
 
-This table replaces one measured on 19 October. That day a Gazebo server left running by
-an earlier run was still up, and the later runs drove the robot in that server, not in the
-one they had started (Gazebo's log said "Another world of the same name is running"). They
-met a simulation that had been running for minutes, which hid the slow start described
-below. The run above started with nothing else of Gazebo's running.
+**Two earlier tables.** This section has shown two tables before this one; neither should
+be relied on.
+
+- The first was measured on 19 October, and it did not measure what it said it measured.
+  The first run that day left its Gazebo server running after it ended, and the later
+  runs, including the one in that table, drove the robot in that leftover server, not in
+  the one they had started (Gazebo's log said "Another world of the same name is
+  running"). They met a simulation that had been running for minutes. The section then
+  presented waiting three seconds after the first odometry (`--settle`) as the answer to a
+  late first command, a wait that had only been tried against the leftover server.
+- The second was measured earlier on 20 October, from a clean start, with that
+  three-second wait and with the bridge reading on the simulation's `/clock`. Its first command
+  reached the gate 1,544 ms after the recorder received it, over the 1,000 ms limit, so
+  the gate refused it, kept the robot still and signed a receipt saying so, and the
+  verifier reported `GATE_REFUSED`. The machine had stalled: the simulation's time showed
+  no advance in the five seconds after that command, and Windows had as little as 1.5 GB
+  of memory free. The recorder also crashed as it shut down (below).
+
+This version replaces the fixed wait with the wait for steady odometry described above,
+and times the reading on the odometry's own stamps instead of `/clock`. The run above is
+one run: its first command was applied, but it does not show that the wait prevents a
+late first command. A stall like the one in the second run, which held up more than the
+simulation, is not something steady odometry can rule out.
+
+**The recorder no longer crashes at shutdown.** The previous version crashed
+(segmentation fault) in about one launch in ten as it shut down, always after its journal
+and the exit file it writes for the launcher were complete, so the runner and the tests,
+which read that file, took it for a clean exit. The node exited without first shutting
+down its middleware: the thread that published its status held the node's publishers for
+the life of the process, and through them the middleware, so Fast DDS's threads were still
+running while the process unloaded their library. The node now ends that thread and lets
+the middleware shut down before it exits. In a loop of launches and stops, the previous
+version crashed in 4 of 40; this one ended cleanly in 100 of 100. The runners and the tests
+now report how each process really ended, read from launch's own log (its exit code, or
+the signal that ended it), and say so when the exit file disagrees. A process that crashed
+does not count as passing.
 
 What the run showed about timing:
 
-- The machine stalled at the start. The first command took 1,544 ms to get from the
-  recorder to the gate. The bridge then saw the simulation's clock advance less than a
-  second in the five seconds it waits at most (the runner's own record of `/clock` shows no
-  advance at all), so that reading was taken at the wall-clock cap. Around the same time
-  the recorder's own two-second heartbeats came up to three seconds late, so the recorder
-  was held up too, not only Gazebo; Windows had as little as 1.5 GB of memory free during
-  the run. On 19 October, in the one run that started Gazebo fresh and had no wait after
-  the first odometry, the first command reached the wheels about 0.8 s late and its reading
-  caught the robot at 134 mm/s, still accelerating. The runner now waits three seconds after
-  the first odometry (`--settle`); here that was not enough.
-- Simulated time ran at 0.98 of real time while the commands were sent (measured from
-  `/clock`; between 0.84 and 0.98 on 19 October). The bridge times each reading on the
-  simulation's clock, so the other four readings came 1.00 to 1.04 s of the robot's own time
-  after the action, 1,032 to 1,061 ms of wall time. This matters when a simulation runs
-  slower than real time. With the stand-in below running at 0.6 of real time, readings on
-  the wall clock came 0.62 s of its time after the action and caught it still responding
-  (192 mm/s of 200, 481 mrad/s of 500); readings on its clock came after 1.03 to 1.04 s of
-  its time, about 1.7 s of wall time, and found it at the speed it was given (199 and 498).
-  The feedback report keeps its wall-clock `after_ms` (SPEC 4.6); `SUMMARY.md` adds the
-  simulated time for each reading and the factor for the run.
-- Gazebo publishes `/clock` about 990 times a second, once per 1 ms step, and a Python
-  node that only receives those messages uses about half of one core (45 to 48% here). The
-  bridge subscribes to `/clock` when it reads on the simulation's clock, and the runner
-  always does, to measure the factor.
+- The odometry was steady as soon as it arrived, so the first command was sent 2.0 s after
+  the first odometry, the shortest the wait allows.
+- The time in the odometry's stamps ran at 0.93 of real time while the commands were sent.
+  The bridge times each reading on those stamps, so the readings came 0.99 to 1.02 s of
+  the robot's own time after the action, 1,012 to 1,298 ms of wall time. This matters when
+  a simulation runs slower than real time: a reading timed on the wall clock then comes
+  before a second of the robot's own time has passed and can catch the robot before it has
+  finished responding. The tests run the stand-in below at 0.6 of real time and check that
+  a reading timed on its stamps waits for its own second. The feedback report keeps its
+  wall-clock `after_ms` (SPEC 4.6); `SUMMARY.md` adds the simulated time for each reading
+  and the factor for the run.
+- Neither the bridge nor the runner subscribes to `/clock` any more. Gazebo publishes it
+  about 990 times a second, and a Python node that only received those messages used about
+  half of one core (45 to 48%). In this run the bridge's average use of one core, since it
+  started, was 4 to 5% while the commands were sent.
 - TurtleBot3's own `empty_world.launch.py` always opens Gazebo's window.
   `ros2/examples/turtlebot3_headless.launch.py` starts the same world and robot without
   it, through ROBOTIS's own launch files for the robot. Gazebo's server takes longer to stop
-  than its launch waits; the runner stops anything of the simulation that is still running
-  when it is done. That runner sweep came after the first run of 19 October, whose server
-  was the one left running.
+  than its launch waits: in all four runs kept from 19 and 20 October, Gazebo ignored
+  SIGINT for five seconds and was ended with SIGTERM, and in three of them TurtleBot3's
+  `parameter_bridge` crashed as it stopped (SIGSEGV twice, SIGABRT once). Those are the
+  simulation's own processes. The runner stops anything of the simulation that is still
+  running when it is done; after the run above, nothing was.
 
 Each run leaves, in one folder: the journal (`data/logchain.journal`), the verifier's
 report as text and as JSON, the journal exported as RFC 5424 syslog with the offline
@@ -797,8 +824,9 @@ commands on a topic and publishes `nav_msgs/Odometry`, but only the Burger has b
 In the tests, `ros2/stand_in_sim.py` stands in for a simulation (a two-wheeled base with a
 lag and no physics), so the runner is tested without a simulator: with `Twist`, and with
 `TwistStamped`, wheels that never turn and a process left behind that ignores SIGINT and
-SIGTERM, and with a `/clock` running at 0.6 of real time (`--clock-rate 0.6`), read on that
-clock and on the wall clock.
+SIGTERM; with its odometry's time stamps running at 0.6 of real time (`--clock-rate 0.6`),
+read on those stamps and on the wall clock; and paused (`--paused`), its stamps standing
+still, where the runner must time out, send no command and leave nothing running.
 
 ## The EU Machinery Regulation profile
 
@@ -859,7 +887,7 @@ git clone https://github.com/JakPot42/sentinel-ledger
 cd sentinel-ledger
 cd recorder && cargo build && cargo test && cd ..
 python demo/run_scenarios.py      # exit 0 only if all five scenarios are as expected
-python -m pytest tests            # 234 tests without ROS 2 (30 more are skipped); builds six deliberately broken recorders
+python -m pytest tests            # 242 tests without ROS 2 (32 more are skipped); builds six deliberately broken recorders
 ```
 
 To read one journal's report after the scenarios have run:
