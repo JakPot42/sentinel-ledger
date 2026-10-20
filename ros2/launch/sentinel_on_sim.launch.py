@@ -9,8 +9,8 @@ the simulated robot there is ros2/sim_bridge.py, the same gate in front of the r
 the simulation, and the simulation itself, started from SL_SIM_COMMAND (split as a shell
 would, but not run through one). Optional: SL_SIM_CMD_TOPIC (default /cmd_vel),
 SL_SIM_CMD_TYPE (twist or twist_stamped, default twist), SL_SIM_ODOM_TOPIC (default /odom),
-SL_SIM_READ_CLOCK (wall or sim, default wall: the clock the bridge times its odometry
-reading on).
+SL_SIM_READ_CLOCK (wall or stamp, default wall: whether the bridge times its odometry
+reading on the wall clock or on the odometry's own stamps).
 
 When the bridge and the recorder have both exited, which they do when the run is over,
 everything is shut down, the simulation included. Not before: launch stops what is still

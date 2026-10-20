@@ -7,23 +7,27 @@ verifier's report.
     python3 ros2/run_on_your_sim.py --node /path/to/sentinel_recorder_node \
         --sim "ros2 launch ros2/examples/turtlebot3_headless.launch.py" --env TURTLEBOT3_MODEL=burger \
         [--cmd-topic /cmd_vel] [--cmd-type twist|twist_stamped] [--odom-topic /odom] \
-        [--speed 0.2] [--turn 0.5] [--settle 3] [--read-clock sim|wall] [--out DIR]
+        [--speed 0.2] [--turn 0.5] [--steady 2] [--steady-timeout 60] [--read-clock stamp|wall] \
+        [--out DIR]
 
 What runs (ros2/launch/sentinel_on_sim.launch.py): your simulation, started by the
 command given with --sim; the recorder node, as everywhere else in this repository; and
 ros2/sim_bridge.py, the gate, between the recorder and your robot's command topic. This
-program plays the controller. Once your robot publishes odometry it waits --settle
-seconds (default 3), since a simulator can publish odometry before it takes commands, and
-then sends five velocity commands to the recorder: forward, turn, forward with the light
+program plays the controller. A simulator can publish odometry before it takes commands,
+so once your robot publishes odometry this program waits until the odometry is arriving
+steadily and its stamps, the simulation's own time, have advanced at a steady rate for
+--steady seconds (default 2), and gives up after --steady-timeout seconds (default 60).
+Then it sends five velocity commands to the recorder: forward, turn, forward with the light
 curtain interrupted (the ruleset blocks it, so the robot is given its safe state),
 forward more slowly, stop. Each command becomes a signed record, the gate checks each
 record before your robot is given anything, signs a receipt for what it did, and after
 each command reads your robot's odometry and signs that as the actuator's feedback. All
-of it goes into the journal. If the simulation publishes /clock, the bridge waits for one
-second of the simulation's own time before each reading (--read-clock sim, the default
-here; at most five seconds of wall time), and SUMMARY.md says how fast simulated time ran
-against the wall clock and how much of it passed before each reading. When the run is
-over, anything of the simulation's still running is stopped.
+of it goes into the journal. The bridge takes each reading once the odometry's stamps have
+advanced one second since the action (--read-clock stamp, the default here; at most five
+seconds of wall time; odometry stamped with zero is read on the wall clock), and SUMMARY.md
+says how fast the stamps' time ran against the wall clock and how much of it passed before
+each reading. When the run is over, anything of the simulation's still running is
+stopped.
 
 What you get, in the run's folder (printed at the end):
   data/logchain.journal   the journal: every record, numbered, chained and signed
@@ -53,10 +57,10 @@ import time
 
 import rclpy
 from nav_msgs.msg import Odometry
-from rosgraph_msgs.msg import Clock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import bridge_units  # noqa: E402
 import run_ros_scenarios as base  # noqa: E402
 from run_ros_scenarios import CLEAR, TimedOut, describe_exit, kinds  # noqa: E402
 
@@ -71,11 +75,13 @@ class SimSession(base.Session):
     """A session whose robot is someone else's simulation, behind ros2/sim_bridge.py."""
 
     def __init__(self, out, name, node_bin, sim_command, cmd_topic, cmd_type, odom_topic, env, start_timeout,
-                 settle=3.0, read_clock="sim"):
+                 steady=2.0, steady_timeout=60.0, read_clock="stamp"):
         super().__init__(out, name, node_bin)
         self.launch_file = LAUNCH
         self.robot_process = "bridge"
-        self.odom_topic, self.start_timeout, self.settle = odom_topic, start_timeout, settle
+        self.odom_topic, self.start_timeout = odom_topic, start_timeout
+        self.steady, self.steady_timeout = steady, steady_timeout
+        self.steady_after = None   # seconds from the first odometry until it was steady
         self.left_running = False
         self.extra_env = dict(env, SL_SIM_COMMAND=sim_command, SL_SIM_CMD_TOPIC=cmd_topic,
                               SL_SIM_CMD_TYPE=cmd_type, SL_SIM_ODOM_TOPIC=odom_topic,
@@ -83,50 +89,69 @@ class SimSession(base.Session):
 
     def launch(self):
         started = super().launch()
-        self.odometry, self.clock = [], []
-        self.node.create_subscription(Odometry, self.odom_topic, self.odometry.append, 10)
-        # The simulation's own clock, if it publishes one, against the wall clock: how fast
-        # simulated time ran while the commands were sent, and how much of it passed before
-        # each reading. Each sample: (monotonic, wall clock, simulated), in seconds.
-        self.node.create_subscription(
-            Clock, "/clock", lambda m: self.clock.append(
-                (time.monotonic(), time.time(), m.clock.sec + m.clock.nanosec / 1e9)), 10)
+        # Each odometry message as it arrives: (monotonic, wall clock, its stamp or None), in
+        # seconds. The stamps are the simulation's own time, against the wall clock: whether
+        # the simulation is running steadily, how fast its time ran while the commands were
+        # sent, and how much of it passed before each reading.
+        self.odometry = []
+        self.node.create_subscription(Odometry, self.odom_topic, lambda m: self.odometry.append(
+            (time.monotonic(), time.time(), bridge_units.stamp_seconds(m.header.stamp.sec, m.header.stamp.nanosec))),
+            10)
         # A simulator can take a minute or more to load a world; nothing is commanded before
         # the robot is publishing odometry.
         self.wait(lambda: len(self.odometry) >= 1, self.start_timeout, "odometry on " + self.odom_topic)
         # The first odometry can come before the simulation is ready to take commands: on a
-        # TurtleBot3 in Gazebo the first command once reached the wheels 0.8 s late. Wait.
-        self.quiet(self.settle)
+        # TurtleBot3 in Gazebo a first command reached the wheels 0.8 s late, and three
+        # seconds of waiting after the first odometry did not prevent it. Wait until the
+        # simulation's time is advancing steadily.
+        first = self.odometry[0][0]
+        self.wait(self.odometry_steady, self.steady_timeout,
+                  "odometry arriving steadily, its stamps advancing at a steady rate, for %g s" % self.steady)
+        self.steady_after = time.monotonic() - first
         return started
+
+    def odometry_steady(self):
+        now = time.monotonic()
+        recent = [(m, stamp) for m, _, stamp in self.odometry if m >= now - self.steady - 1.0]
+        return bridge_units.steady(recent, now, self.steady)
 
     def end(self):
         """As Session.end, then stop anything of the simulation's that outlived its launch
-        (Gazebo can take longer to stop than launch waits). Everything started here is in
-        one process group."""
+        (Gazebo can take longer to stop than launch waits)."""
         stopped = super().end()
-        if group_alive(self.proc.pid):
-            self.left_running = True
-            os.killpg(self.proc.pid, signal.SIGINT)
-            deadline = time.monotonic() + 20
-            while group_alive(self.proc.pid) and time.monotonic() < deadline:
-                time.sleep(0.5)
-            if group_alive(self.proc.pid):
-                os.killpg(self.proc.pid, signal.SIGKILL)
+        self.left_running = self.stop_everything()
         return stopped
 
+    def stop_everything(self):
+        """Stop every process this run started, the launch and anything that outlived it:
+        SIGINT, then SIGKILL after twenty seconds. Everything started here is in one process
+        group. Returns whether anything was still running."""
+        if self.proc is None or not group_alive(self.proc.pid):
+            return False
+        os.killpg(self.proc.pid, signal.SIGINT)
+        deadline = time.monotonic() + 20
+        while group_alive(self.proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        if group_alive(self.proc.pid):
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        return True
+
+    def stamped(self):
+        return [o for o in self.odometry if o[2] is not None]
+
     def real_time_factor(self, since):
-        """Simulated seconds per wall second from `since` (time.monotonic()) until now, from
-        /clock; None if the simulation published no clock in that time."""
-        seen = [c for c in self.clock if c[0] >= since]
+        """Seconds of the odometry's stamps per wall second from `since` (time.monotonic())
+        until now; None if no stamped odometry arrived in that time."""
+        seen = [o for o in self.stamped() if o[0] >= since]
         if len(seen) < 2 or seen[-1][0] - seen[0][0] <= 0:
             return None
         return (seen[-1][2] - seen[0][2]) / (seen[-1][0] - seen[0][0])
 
     def sim_at(self, wall):
         """The simulation's time at wall-clock time `wall` (seconds since the epoch), from the
-        /clock samples either side of it; None outside them."""
-        before = [c for c in self.clock if c[1] <= wall]
-        after = [c for c in self.clock if c[1] >= wall]
+        stamps of the odometry that arrived either side of it; None outside them."""
+        before = [o for o in self.stamped() if o[1] <= wall]
+        after = [o for o in self.stamped() if o[1] >= wall]
         if not before or not after:
             return None
         (_, w0, s0), (_, w1, s1) = before[-1], after[0]
@@ -203,16 +228,19 @@ def export_and_check(s, root):
 def write_summary(s, args, table, verified, exits, export_code, rtf=None, exit_files=(None, None)):
     code, report = verified
     if rtf is None:
-        pace = ("The simulation published no /clock, so how fast its time ran was not measured, and "
-                "the bridge timed each odometry reading on the wall clock.")
-    elif args.read_clock == "sim":
-        pace = ("While the commands were sent, simulated time ran at %.2f of real time (from /clock). "
-                "The bridge took each odometry reading once /clock had advanced 1 s since the action, "
-                "or after 5 s of wall time if it had not." % rtf)
+        pace = ("The odometry carried no stamps, so how fast the simulation's time ran was not measured, "
+                "and the bridge timed each odometry reading on the wall clock.")
+    elif args.read_clock == "stamp":
+        pace = ("While the commands were sent, the time in the odometry's stamps ran at %.2f of real time. "
+                "The bridge took each odometry reading once the stamps had advanced 1 s since the action, "
+                "or after 5 s of wall time if they had not." % rtf)
     else:
-        pace = ("While the commands were sent, simulated time ran at %.2f of real time (from /clock). "
+        pace = ("While the commands were sent, the time in the odometry's stamps ran at %.2f of real time. "
                 "The bridge timed its odometry reading on the wall clock (--read-clock wall), so its "
-                "1 s wait was about %.2f s of simulated time." % (rtf, rtf))
+                "1 s wait was about %.2f s of the simulation's time." % (rtf, rtf))
+    if s.steady_after is not None:
+        pace += (" The first command was sent %.1f s after the first odometry, once the odometry had been "
+                 "arriving steadily, its stamps advancing at a steady rate, for %g s." % (s.steady_after, s.steady))
     lines = ["# A signed log on a simulated robot", "",
              "Simulation: `%s`" % args.sim, "",
              "Command topic `%s` (%s), odometry `%s`." % (args.cmd_topic, args.cmd_type, args.odom_topic), "",
@@ -253,11 +281,14 @@ def main(argv=None):
     ap.add_argument("--speed", type=float, default=0.2, help="forward speed for the script, m/s")
     ap.add_argument("--turn", type=float, default=0.5, help="turn rate for the script, rad/s")
     ap.add_argument("--start-timeout", type=float, default=180, help="seconds to wait for the first odometry")
-    ap.add_argument("--settle", type=float, default=3.0,
-                    help="seconds to wait after the first odometry before the first command (default 3)")
-    ap.add_argument("--read-clock", choices=("sim", "wall"), default="sim",
-                    help="time the wait before each odometry reading on the simulation's /clock where it "
-                         "publishes one (sim, the default) or on the wall clock (wall)")
+    ap.add_argument("--steady", type=float, default=2.0,
+                    help="seconds for which the odometry must arrive steadily, its stamps advancing at a steady "
+                         "rate, before the first command (default 2)")
+    ap.add_argument("--steady-timeout", type=float, default=60.0,
+                    help="seconds after the first odometry to wait for that before giving up (default 60)")
+    ap.add_argument("--read-clock", choices=("stamp", "wall"), default="stamp",
+                    help="time the wait before each odometry reading on the odometry's own stamps (stamp, the "
+                         "default) or on the wall clock (wall)")
     ap.add_argument("--out", default=os.path.join(HERE, "out", "your_sim"))
     args = ap.parse_args(argv)
     env = {}
@@ -269,7 +300,8 @@ def main(argv=None):
 
     rclpy.init()
     s = SimSession(os.path.abspath(args.out), "run", os.path.abspath(args.node), args.sim, args.cmd_topic,
-                   args.cmd_type, args.odom_topic, env, args.start_timeout, args.settle, args.read_clock)
+                   args.cmd_type, args.odom_topic, env, args.start_timeout, args.steady, args.steady_timeout,
+                   args.read_clock)
     try:
         s.launch()
         began = time.monotonic()
@@ -278,8 +310,8 @@ def main(argv=None):
         stopped = s.end()
     except TimedOut as exc:
         print("could not run: %s. The launch log is in %s" % (exc, s.dir), file=sys.stderr)
-        if s.proc is not None and s.proc.poll() is None:
-            os.killpg(s.proc.pid, signal.SIGINT)
+        # Nothing may be left running, a simulator's server included.
+        s.stop_everything()
         return 1
     finally:
         if rclpy.ok():

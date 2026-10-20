@@ -1,9 +1,12 @@
-"""Units between a record and a ROS 2 robot, for ros2/sim_bridge.py. No ROS imports, so
-the conversions can be tested anywhere.
+"""Units between a record and a ROS 2 robot, for ros2/sim_bridge.py, and the timing the
+bridge and ros2/run_on_your_sim.py read from odometry's stamps. No ROS imports, so all of
+it can be tested anywhere.
 
 A record carries whole numbers: millimetres per second and milliradians per second, under
 six keys (SPEC 7.3). A robot's command topic carries metres and radians per second as
 floats, and its odometry reports the same, with a pose as a position and a quaternion.
+A simulation stamps its odometry with its own time, which can run slower than the wall
+clock.
 """
 import math
 
@@ -36,17 +39,63 @@ def pose_state(px, py, qx, qy, qz, qw):
             "heading_mrad": int(round(yaw_of(qx, qy, qz, qw) * 1000))}
 
 
-def reading_due(clock, wall_now, sim_now, acted, read_after, cap):
-    """Whether the odometry reading for the action in force is due. `acted` is when the
-    action took effect: (wall-clock seconds, simulated seconds or None).
+def stamp_seconds(sec, nanosec):
+    """The time in a message's header stamp, in seconds; None for a stamp left at zero, as
+    a publisher that does not stamp its messages leaves it."""
+    if sec == 0 and nanosec == 0:
+        return None
+    return sec + nanosec / 1e9
+
+
+def reading_due(clock, wall_now, stamp_now, acted, read_after, cap):
+    """Whether the odometry reading for the action in force is due. `stamp_now` is the stamp
+    of the latest odometry, in seconds, or None. `acted` is when the action took effect:
+    (wall-clock seconds, the stamp of the latest odometry then, or None).
 
     clock "wall": once the action has been in force for `read_after` seconds of wall time.
-    clock "sim": once the simulation's clock has advanced `read_after` seconds since then,
+    clock "stamp": once the odometry's stamps have advanced `read_after` seconds since then,
     or after `cap` seconds of wall time, whichever comes first, so a simulation that is
-    paused or stalled is still read. Where there is no simulated time (no /clock seen, now
-    or when the action took effect), as "wall"."""
-    acted_wall, acted_sim = acted
+    paused or stalled is still read. A simulation stamps its odometry with its own time, so
+    this waits for `read_after` seconds of the robot's time. Where there is no stamp (none
+    yet, or stamps left at zero, now or when the action took effect), as "wall"."""
+    acted_wall, acted_stamp = acted
     waited = wall_now - acted_wall
-    if clock == "sim" and sim_now is not None and acted_sim is not None:
-        return sim_now - acted_sim >= read_after or waited >= cap
+    if clock == "stamp" and stamp_now is not None and acted_stamp is not None:
+        return stamp_now - acted_stamp >= read_after or waited >= cap
     return waited >= read_after
+
+
+def steady(samples, now, window, max_gap=0.5, tolerance=0.25):
+    """Whether odometry has been arriving steadily, with its stamps advancing at a steady
+    rate, for the last `window` seconds of wall time up to `now`. `samples` are
+    (arrival, stamp) pairs in the order they arrived: arrival on the wall clock (monotonic
+    seconds), stamp in seconds or None.
+
+    Steady means all of: odometry was already arriving before the window began; no gap of
+    more than `max_gap` seconds between arrivals in it, or since the last; and the stamps
+    advanced at a rate above zero in both halves of the window, the two rates within
+    `tolerance` of the larger. A slow rate is steady if it holds. Where the stamps in the
+    window are all None (unstamped odometry), arriving steadily is all there is to see, and
+    that is enough."""
+    start = now - window
+    before = [s for s in samples if s[0] < start]
+    recent = [s for s in samples if s[0] >= start]
+    if not before or not recent:
+        return False
+    arrivals = [before[-1][0]] + [s[0] for s in recent] + [now]
+    if max(b - a for a, b in zip(arrivals, arrivals[1:])) > max_gap:
+        return False
+    stamps = [s[1] for s in recent]
+    if all(st is None for st in stamps):
+        return True
+    if any(st is None for st in stamps):
+        return False
+    middle = start + window / 2
+    rates = []
+    for half in ([s for s in recent if s[0] < middle], [s for s in recent if s[0] >= middle]):
+        if len(half) < 2 or half[-1][0] <= half[0][0]:
+            return False
+        rates.append((half[-1][1] - half[0][1]) / (half[-1][0] - half[0][0]))
+    if min(rates) <= 0:
+        return False
+    return abs(rates[0] - rates[1]) <= tolerance * max(rates)

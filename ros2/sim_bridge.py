@@ -3,7 +3,7 @@
 
     sim_bridge.py [the options of ros2/sim_robot.py]
                   [--cmd-topic /cmd_vel] [--cmd-type twist|twist_stamped] [--odom-topic /odom]
-                  [--read-after 1.0] [--read-clock wall|sim] [--read-cap 5.0]
+                  [--read-after 1.0] [--read-clock wall|stamp] [--read-cap 5.0]
 
 ros2/sim_robot.py is a point with a pose and the gate inside it. This is the same gate,
 the same receipts and the same feedback reporter, standing between the recorder and a
@@ -23,13 +23,17 @@ velocity commands on a topic and publishes odometry). Only two things change:
 When the reading is due. With `--read-clock wall` (the default) those seconds are wall-clock
 seconds. A simulation can run slower than real time, and then one wall second is less than
 a second of the robot's own time, so the reading can come before the robot has finished
-responding. With `--read-clock sim` they are seconds of the simulation's own clock, from
-/clock (rosgraph_msgs/Clock): the reading is due once /clock has advanced `--read-after`
-seconds since the action took effect, or after `--read-cap` seconds of wall time (default
-5.0) if it has not, so a paused or stalled simulation is still read. Where no /clock has
-been seen, the wall clock decides. Either way the deadman and the limit on a command's age
-stay on the wall clock: they watch the link to the recorder, which runs in real time. The
-feedback report is unchanged (SPEC 4.6): its `after_ms` is wall-clock time.
+responding. With `--read-clock stamp` they are seconds of the robot's own time, read from
+the odometry's header stamps, which a simulation sets to its own time: the reading is due
+once the stamps have advanced `--read-after` seconds since the action took effect (from the
+stamp of the latest odometry then), or after `--read-cap` seconds of wall time (default
+5.0) if they have not, so a paused or stalled simulation is still read. Odometry stamped
+with zero, as a publisher that does not stamp leaves it, is read on the wall clock. No
+/clock subscription is needed: a simulation publishes /clock once per step, a thousand
+times a second for Gazebo, and only receiving that costs a Python node about half a core.
+Either way the deadman and the limit on a command's age stay on the wall clock: they watch
+the link to the recorder, which runs in real time. The feedback report is unchanged (SPEC
+4.6): its `after_ms` is wall-clock time.
 
 What this does not do. The robot's command topic is an ordinary topic, so any node can
 publish to it and move the robot without a record (SPEC 15.7): this bridge does not
@@ -38,8 +42,7 @@ model, nothing more. Odometry is the simulation's word, as feedback is the contr
 
 Topics, besides those of ros2/sim_robot.py:
   --cmd-topic   geometry_msgs/Twist or TwistStamped  out  what the gate passed on
-  --odom-topic  nav_msgs/Odometry                    in   what the robot measured
-  /clock        rosgraph_msgs/Clock                  in   the simulation's time (--read-clock sim)
+  --odom-topic  nav_msgs/Odometry                    in   what the robot measured, and when
 """
 import json
 import os
@@ -48,7 +51,6 @@ import time
 
 from geometry_msgs.msg import Twist, TwistStamped
 from nav_msgs.msg import Odometry
-from rosgraph_msgs.msg import Clock
 from std_msgs.msg import String
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -62,13 +64,11 @@ class SimBridge(SimRobot):
     def __init__(self, args):
         self.odometry = None             # the latest (linear, angular, pose) from the robot
         self.odometry_count = 0
-        self.sim_now = None              # the simulation's time from /clock, in seconds
-        self.acted_at = (time.monotonic(), None)   # when the action in force took effect: (wall, sim)
+        self.stamp_now = None            # the latest odometry's stamp, in seconds, or None
+        self.acted_at = (time.monotonic(), None)   # when the action in force took effect: (wall, stamp)
         super().__init__(args)
         self.read_after = max(STEP, args.read_after)
         self.read_clock, self.read_cap = args.read_clock, args.read_cap
-        if self.read_clock == "sim":
-            self.create_subscription(Clock, "/clock", self.on_clock, 10)
         self.stamped = args.cmd_type == "twist_stamped"
         self.out = self.create_publisher(TwistStamped if self.stamped else Twist, args.cmd_topic, 10)
         self.create_subscription(Odometry, args.odom_topic, self.on_odometry, 10)
@@ -79,15 +79,13 @@ class SimBridge(SimRobot):
                          (p.position.x, p.position.y, p.orientation.x, p.orientation.y, p.orientation.z,
                           p.orientation.w))
         self.odometry_count += 1
+        self.stamp_now = bridge_units.stamp_seconds(msg.header.stamp.sec, msg.header.stamp.nanosec)
         state = bridge_units.pose_state(*self.odometry[2])
         self.pose = [state["x_mm"] / 1000.0, state["y_mm"] / 1000.0, state["heading_mrad"] / 1000.0]
 
-    def on_clock(self, msg):
-        self.sim_now = msg.clock.sec + msg.clock.nanosec / 1e9
-
     def act(self, decision):
         if decision["send"] is not None:
-            self.acted_at = (time.monotonic(), self.sim_now)
+            self.acted_at = (time.monotonic(), self.stamp_now)
         super().act(decision)
 
     def wheels(self):
@@ -139,7 +137,7 @@ class SimBridge(SimRobot):
         # before the gate passes on anything else (SimRobot.act). Either way it describes
         # this action (SPEC 4.6).
         if self.reporter is not None and self.reporter.due() and bridge_units.reading_due(
-                self.read_clock, time.monotonic(), self.sim_now, self.acted_at, self.read_after, self.read_cap):
+                self.read_clock, time.monotonic(), self.stamp_now, self.acted_at, self.read_after, self.read_cap):
             self.send_feedback(self.read_wheels())
 
 
@@ -152,10 +150,10 @@ def main(argv=None):
     ap.add_argument("--read-after", type=float, default=1.0,
                     help="seconds an action is in force before its feedback reading is taken (default 1.0); "
                          "a new action before then takes the reading at once")
-    ap.add_argument("--read-clock", choices=("wall", "sim"), default="wall",
-                    help="time --read-after on the wall clock (default) or on the simulation's /clock")
+    ap.add_argument("--read-clock", choices=("wall", "stamp"), default="wall",
+                    help="time --read-after on the wall clock (default) or on the odometry's own stamps")
     ap.add_argument("--read-cap", type=float, default=5.0,
-                    help="with --read-clock sim: wall-clock seconds after which the reading is taken anyway "
+                    help="with --read-clock stamp: wall-clock seconds after which the reading is taken anyway "
                          "(default 5.0)")
     args, _ = ap.parse_known_args(argv)
     return sim_robot.run(SimBridge, ap, args)
