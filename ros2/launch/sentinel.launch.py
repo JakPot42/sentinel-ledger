@@ -14,7 +14,9 @@ recorder never sees that file. When it names a `feedback_public_key`, the robot 
 the feedback key, `robot_private/feedback.key`, and signs what its wheels did after each
 command with it, keeping the number of its next report in `robot_side/feedback.state`.
 Each process also writes its exit code to a file there, because a launch does not hand
-them back.
+them back. The processes are named `recorder` and `robot`, so that launch's own log line
+for each exit (`[recorder-1]: process has died [pid ..., exit code -11, ...]`) says which
+it was: a process can write 0 to its file and still crash after that.
 """
 import json
 import os
@@ -35,6 +37,7 @@ def generate_launch_description():
         config = json.load(fh)
         safe_state = json.dumps(config["safe_state_action"])
     recorder = ExecuteProcess(
+        name="recorder",
         cmd=[os.environ["SL_NODE_BIN"]],
         additional_env={"SL_DATA_DIR": os.path.join(work, "data"),
                         "SL_INSTALLED": os.path.join(work, "installed"),
@@ -50,6 +53,7 @@ def generate_launch_description():
         deadman += ["--feedback-key", os.path.join(work, "robot_private", "feedback.key"),
                     "--feedback-state", os.path.join(robot_side, "feedback.state")]
     robot = ExecuteProcess(
+        name="robot",
         cmd=[sys.executable, os.path.join(here, "sim_robot.py"),
              "--state", os.path.join(robot_side, "gate.state"),
              "--actuator", os.path.join(robot_side, "actuator.jsonl"),

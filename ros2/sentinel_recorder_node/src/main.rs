@@ -21,7 +21,7 @@
 //! Exit codes: 0 stopped in an orderly way, 3 ended in the safe state, 1 could not start.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -133,6 +133,27 @@ impl Trace {
 /// can look at it without competing with the recorder for the lock.
 const RUNNING: i32 = -1;
 
+/// What the publishing thread is given, in order.
+enum Out {
+    Record(String),
+    Status(String),
+    /// Nothing more will be published: the thread ends, and drops its publishers.
+    End,
+}
+
+/// End the publishing thread and wait for it, so that it lets go of the publishers.
+///
+/// The publishers hold the node, and the node holds the context. While anything holds the
+/// context, the middleware is not shut down: its DDS participant and its threads keep
+/// running. If the process then exits, exit() unloads the middleware's libraries while those
+/// threads still run code in them, and the process crashes (SIGSEGV), after the journal
+/// and the exit file are written. That happened in about one shutdown in ten. Everything
+/// else that holds the middleware is dropped when run() returns, the context last.
+fn end_publishing(queue: &mpsc::Sender<Out>, thread: std::thread::JoinHandle<()>) {
+    let _ = queue.send(Out::End);
+    let _ = thread.join();
+}
+
 fn reply(result: Result<Value, Fail>) -> Value {
     match result {
         Ok(mut v) => {
@@ -168,13 +189,9 @@ fn run() -> Result<i32, String> {
     // its lock it only puts a line on the queue. This matters for more than speed. With
     // publishing done under the lock, a publish that was slow (seen while late-joining
     // subscribers were being matched) held up the heartbeat for seconds.
-    enum Out {
-        Record(String),
-        Status(String),
-    }
     let (queue, outbox) = mpsc::channel::<Out>();
     let pending = Arc::new(AtomicUsize::new(0));
-    {
+    let publishing = {
         let (out, status, pending) = (Arc::clone(&out), Arc::clone(&status), Arc::clone(&pending));
         let trace = trace.clone();
         std::thread::spawn(move || {
@@ -183,14 +200,15 @@ fn run() -> Result<i32, String> {
                 let _ = match message {
                     Out::Record(data) => out.publish(Text { data }),
                     Out::Status(data) => status.publish(Text { data }),
+                    Out::End => break,
                 };
                 if began.elapsed() > Duration::from_millis(50) {
                     trace.line("publish_slow", json!({"ms": ms(began.elapsed())}));
                 }
                 pending.fetch_sub(1, Ordering::SeqCst);
             }
-        });
-    }
+        })
+    };
     let say = {
         let (queue, pending) = (queue.clone(), Arc::clone(&pending));
         move |v: Value| {
@@ -262,6 +280,7 @@ fn run() -> Result<i32, String> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             let _ = executor.spin(SpinOptions::default().timeout(Duration::from_millis(500)));
+            end_publishing(&queue, publishing);
             return Ok(3);
         }
     };
@@ -409,9 +428,14 @@ fn run() -> Result<i32, String> {
     // a message arrived.
     let (s, tell, tracing, stopping) = (Arc::clone(&shared), say.clone(), trace.clone(), Arc::clone(&stop));
     let failed = Arc::clone(&anchor_failures);
-    std::thread::spawn(move || loop {
+    let ending = Arc::new(AtomicBool::new(false));
+    let heartbeat_ends = Arc::clone(&ending);
+    let heartbeat = std::thread::spawn(move || loop {
         let slept_from = Instant::now();
         std::thread::sleep(Duration::from_millis(200));
+        if heartbeat_ends.load(Ordering::SeqCst) {
+            break;
+        }
         let woke = Instant::now();
         let lost: Vec<(usize, String)> = failed.lock().unwrap().drain(..).collect();
         let mut s = s.lock().unwrap();
@@ -441,7 +465,7 @@ fn run() -> Result<i32, String> {
     });
 
     say(json!({"kind": "start", "ok": true}));
-    loop {
+    let code = loop {
         let began = Instant::now();
         let _ = executor.spin(SpinOptions::default().timeout(Duration::from_millis(100)));
         if began.elapsed() > Duration::from_millis(1000) {
@@ -460,16 +484,23 @@ fn run() -> Result<i32, String> {
             for _ in 0..5 {
                 let _ = executor.spin(SpinOptions::default().timeout(Duration::from_millis(100)));
             }
-            return Ok(code);
+            break code;
         }
         if !context.ok() {
             // Interrupted without a stop request: nothing more can be published, so no
             // stop record is written. The journal will show a recorder that ended
             // without an orderly shutdown, which is what happened.
-            return Ok(if shared.lock().unwrap().recorder.fault.is_some() { 3 } else { 0 });
+            break if shared.lock().unwrap().recorder.fault.is_some() { 3 } else { 0 };
         }
         std::thread::sleep(Duration::from_millis(5));
-    }
+    };
+    // Shut down in order before the process exits: the heartbeat, then the publishing
+    // thread (end_publishing says why), then, as run() returns, the subscriptions, the
+    // publishers, the node, the executor and the context, which shuts the middleware down.
+    ending.store(true, Ordering::SeqCst);
+    let _ = heartbeat.join();
+    end_publishing(&queue, publishing);
+    Ok(code)
 }
 
 fn main() {

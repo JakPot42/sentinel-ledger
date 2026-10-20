@@ -24,7 +24,10 @@ After each command record it takes in, the robot also signs, with the feedback k
 its wheels then did, and the recorder writes that into the journal too. Every scenario
 checks the receipts and the feedback the journal ends up holding.
 
-Exit 0 only if every observation of every scenario is the expected one.
+Exit 0 only if every observation of every scenario is the expected one. The recorder's
+and the robot's exit codes are how the processes really ended, from launch's own log, not
+what each wrote in its exit file before ending: a process that writes 0 and then crashes
+as it shuts down has not exited cleanly, and the scenario is not as expected.
 
   1  clean run: commands inside the limits, all six Twist fields, a quiet period with heartbeats
   2  the speed clamp changes commands; NaN, infinity and an over-limit value are refused
@@ -54,6 +57,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -85,6 +89,41 @@ def leaf_hash(text):
 
 class TimedOut(Exception):
     pass
+
+
+# Launch's own line for each process it started, when that process ends.
+PROCESS_EXIT = re.compile(r"\[(\w+)-\d+\]: process has (?:finished cleanly|died \[pid \d+, exit code (-?\d+))")
+
+
+def process_exits(log_path):
+    """How each process a launch started really exited, from the launch's log: {name: code},
+    0 for "finished cleanly", otherwise the code launch reports, where a negative code is the
+    signal that ended the process (-11 is SIGSEGV). A process whose end is not in the log is
+    not in the result."""
+    exits = {}
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            found = PROCESS_EXIT.search(line)
+            if found:
+                exits[found.group(1)] = int(found.group(2) or 0)
+    return exits
+
+
+def describe_exit(code, file_code=None):
+    """A process's exit as a person reads it: "0", "2", "-11 (SIGSEGV)", and what its own exit
+    file said where that differs."""
+    if code is None:
+        text = "unknown (launch did not report it)"
+    elif code < 0:
+        try:
+            text = "%d (%s)" % (code, signal.Signals(-code).name)
+        except ValueError:
+            text = "%d (signal %d)" % (code, -code)
+    else:
+        text = str(code)
+    if file_code is not None and file_code != code:
+        text += ", though its exit file said %s" % file_code
+    return text
 
 
 class Session:
@@ -136,7 +175,10 @@ class Session:
         self.gate_state = os.path.join(self.dir, "robot_side", "gate.state")
         self.actuator = os.path.join(self.dir, "robot_side", "actuator.jsonl")
         self.runs = 0
-        self.exits = []  # (recorder exit, robot exit) for each launch
+        # For each launch: (recorder exit, robot exit), as the processes really exited
+        # (launch's log), and as each wrote in its exit file before it ended.
+        self.exits, self.exit_files = [], []
+        self.robot_process = "robot"   # the robot side's name in the launch file
         self.proc = self.node = None
 
     # -- starting and stopping ----------------------------------------------------------
@@ -185,7 +227,12 @@ class Session:
             rclpy.spin_once(self.node, timeout_sec=0.05)
 
     def end(self):
-        """Ask the recorder to stop and the robot to shut down, and collect exit codes."""
+        """Ask the recorder to stop and the robot to shut down, and collect exit codes.
+
+        The exit codes are how the processes really ended, as launch reports them in its log,
+        not what each wrote in its exit file: a process can write 0 there and then crash
+        while it shuts down, and that is not a clean exit. The files are kept in
+        self.exit_files. A process whose end launch did not report has the exit None."""
         stopped = self.ask(self.control, {"op": "stop"}, "stop")
         self.quiet(0.5)
         self.robot_control.publish(String(data=json.dumps({"op": "shutdown"})))
@@ -197,14 +244,16 @@ class Session:
             self.proc.wait(timeout=30)
         self.log.close()
         self.node.destroy_node()
-        codes = []
+        files = []
         for name in ("recorder.exit", "robot.exit"):
             try:
                 with open(os.path.join(self.dir, name), encoding="utf-8") as fh:
-                    codes.append(json.load(fh)["exit"])
+                    files.append(json.load(fh)["exit"])
             except (OSError, ValueError):
-                codes.append(None)
-        self.exits.append(tuple(codes))
+                files.append(None)
+        real = process_exits(self.log.name)
+        self.exit_files.append(tuple(files))
+        self.exits.append((real.get("recorder"), real.get(self.robot_process)))
         return stopped
 
     # -- acting as the other nodes ------------------------------------------------------
@@ -409,7 +458,7 @@ def summary(s, stopped, report_pair):
     code, report = report_pair
     return {"recorder_exit": s.exits[-1][0], "robot_exit": s.exits[-1][1], "verifier_exit": code,
             "findings": kinds(report), "stopped_cleanly": bool(stopped.get("ok")), "receipts": s.receipts(),
-            "feedback": s.feedback()}
+            "feedback": s.feedback(), "exit_files": s.exit_files[-1]}
 
 
 def scenario_1(s):

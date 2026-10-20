@@ -12,8 +12,11 @@ SL_SIM_CMD_TYPE (twist or twist_stamped, default twist), SL_SIM_ODOM_TOPIC (defa
 SL_SIM_READ_CLOCK (wall or sim, default wall: the clock the bridge times its odometry
 reading on).
 
-When the bridge exits, which it does when the run is over, everything is shut down,
-the simulation included.
+When the bridge and the recorder have both exited, which they do when the run is over,
+everything is shut down, the simulation included. Not before: launch stops what is still
+running with SIGINT, and a recorder still shutting down in order must be left to finish.
+The processes are named `recorder`, `bridge` and `simulation` in launch's log, where launch
+states how each one really exited.
 """
 import json
 import os
@@ -35,6 +38,7 @@ def generate_launch_description():
         config = json.load(fh)
         safe_state = json.dumps(config["safe_state_action"])
     recorder = ExecuteProcess(
+        name="recorder",
         cmd=[os.environ["SL_NODE_BIN"]],
         additional_env={"SL_DATA_DIR": os.path.join(work, "data"),
                         "SL_INSTALLED": os.path.join(work, "installed"),
@@ -50,6 +54,7 @@ def generate_launch_description():
         gate += ["--feedback-key", os.path.join(work, "robot_private", "feedback.key"),
                  "--feedback-state", os.path.join(robot_side, "feedback.state")]
     bridge = ExecuteProcess(
+        name="bridge",
         cmd=[sys.executable, os.path.join(here, "sim_bridge.py"),
              "--state", os.path.join(robot_side, "gate.state"),
              "--actuator", os.path.join(robot_side, "actuator.jsonl"),
@@ -63,7 +68,20 @@ def generate_launch_description():
         output="screen")
     # A simulator can take well over launch's default 5 seconds to stop after SIGINT
     # (Gazebo does); without the longer wait it is left running when the launch ends.
-    simulation = ExecuteProcess(cmd=shlex.split(os.environ["SL_SIM_COMMAND"]), output="screen",
+    simulation = ExecuteProcess(name="simulation", cmd=shlex.split(os.environ["SL_SIM_COMMAND"]), output="screen",
                                 sigterm_timeout="20", sigkill_timeout="10")
-    when_done = RegisterEventHandler(OnProcessExit(target_action=bridge, on_exit=[EmitEvent(event=Shutdown())]))
-    return LaunchDescription([simulation, recorder, bridge, when_done])
+    # The simulation does not end by itself: once the bridge and the recorder have both
+    # ended, launch shuts down, which stops it.
+    ended = set()
+
+    def one_ended(name):
+        def on_exit(event, context):
+            ended.add(name)
+            if ended == {"recorder", "bridge"}:
+                return [EmitEvent(event=Shutdown())]
+            return None
+        return on_exit
+
+    when_done = [RegisterEventHandler(OnProcessExit(target_action=action, on_exit=one_ended(name)))
+                 for name, action in (("recorder", recorder), ("bridge", bridge))]
+    return LaunchDescription([simulation, recorder, bridge] + when_done)

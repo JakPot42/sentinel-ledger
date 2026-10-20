@@ -39,7 +39,9 @@ your robot: any node can still publish to that topic and move the robot with no 
 does not judge whether the robot did what it was told (SPEC 4.6). One run, one script.
 
 Exit codes: 0 the run finished and the verifier found nothing; 2 it finished with a
-finding, or a process exited with an error; 1 it could not run.
+finding, or the recorder or the bridge exited with an error or crashed (how each process
+really ended is read from launch's log, not from the exit file it writes); 1 it could not
+run.
 """
 import argparse
 import json
@@ -56,7 +58,7 @@ from rosgraph_msgs.msg import Clock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import run_ros_scenarios as base  # noqa: E402
-from run_ros_scenarios import CLEAR, TimedOut, kinds  # noqa: E402
+from run_ros_scenarios import CLEAR, TimedOut, describe_exit, kinds  # noqa: E402
 
 REPO = os.path.dirname(HERE)
 LAUNCH = os.path.join(HERE, "launch", "sentinel_on_sim.launch.py")
@@ -72,6 +74,7 @@ class SimSession(base.Session):
                  settle=3.0, read_clock="sim"):
         super().__init__(out, name, node_bin)
         self.launch_file = LAUNCH
+        self.robot_process = "bridge"
         self.odom_topic, self.start_timeout, self.settle = odom_topic, start_timeout, settle
         self.left_running = False
         self.extra_env = dict(env, SL_SIM_COMMAND=sim_command, SL_SIM_CMD_TOPIC=cmd_topic,
@@ -197,7 +200,7 @@ def export_and_check(s, root):
     return checked.returncode
 
 
-def write_summary(s, args, table, verified, exits, export_code, rtf=None):
+def write_summary(s, args, table, verified, exits, export_code, rtf=None, exit_files=(None, None)):
     code, report = verified
     if rtf is None:
         pace = ("The simulation published no /clock, so how fast its time ran was not measured, and "
@@ -224,7 +227,8 @@ def write_summary(s, args, table, verified, exits, export_code, rtf=None):
         lines.append("| %d | %s | %s | %s | %s | %s, %s |" % (
             row["n"], row["requested"], row["outcome"], row["receipt"], row["sent"], row["measured"], after))
     lines += ["",
-              "Recorder exit %s, bridge exit %s (0: the gate refused nothing)." % exits,
+              "Recorder exit %s, bridge exit %s (0: the gate refused nothing)."
+              % (describe_exit(exits[0], exit_files[0]), describe_exit(exits[1], exit_files[1])),
               "Verifier exit %s, findings: %s." % (code, ", ".join(kinds(report)) or "none"),
               "Export checked offline: exit %s." % export_code, "",
               "The verifier checks that every record, receipt and feedback report is genuine and in "
@@ -286,7 +290,7 @@ def main(argv=None):
         json.dump(verified[1], fh, indent=1, sort_keys=True)
     s.verify_text(root)
     export_code = export_and_check(s, root)
-    text = write_summary(s, args, rows(s), verified, s.exits[-1], export_code, rtf)
+    text = write_summary(s, args, rows(s), verified, s.exits[-1], export_code, rtf, s.exit_files[-1])
     print(text)
     if s.left_running:
         print("The simulation was still running after its launch ended; it has been stopped.")

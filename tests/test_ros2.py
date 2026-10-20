@@ -107,8 +107,28 @@ def test_the_two_nodes_are_separate_processes_started_by_one_launch(ros_node, tm
         log = fh.read()
     started = [line for line in log.splitlines() if "process started with pid" in line]
     assert len(started) == 2
-    assert "sentinel_recorder_node" in started[0] and "python3" in started[1]
+    assert "[recorder-" in started[0] and "[robot-" in started[1]
     assert len({line.split("[")[-1] for line in started}) == 2
+
+
+def test_an_exit_is_how_the_process_really_ended_not_what_its_exit_file_says(tmp_path):
+    """Launch states how each process ended. A recorder that wrote 0 to its exit file and
+    then crashed as it shut down (signal 11) has not exited 0, and is not reported as 0."""
+    import run_ros_scenarios
+    log = tmp_path / "launch-1.log"
+    log.write_text(
+        "[INFO] [recorder-1]: process started with pid [439]\n"
+        "[INFO] [robot-2]: process started with pid [440]\n"
+        "[recorder-1] {\"kind\": \"stop\"}\n"
+        "[ERROR] [recorder-1]: process has died [pid 439, exit code -11, cmd '/x/sentinel_recorder_node'].\n"
+        "[ERROR] [robot-2]: process has died [pid 440, exit code 2, cmd 'python3 sim_robot.py'].\n",
+        encoding="utf-8")
+    assert run_ros_scenarios.process_exits(str(log)) == {"recorder": -11, "robot": 2}
+    log.write_text("[INFO] [recorder-1]: process has finished cleanly [pid 439]\n", encoding="utf-8")
+    assert run_ros_scenarios.process_exits(str(log)) == {"recorder": 0}
+    assert run_ros_scenarios.describe_exit(-11, 0) == "-11 (SIGSEGV), though its exit file said 0"
+    assert run_ros_scenarios.describe_exit(0, 0) == "0"
+    assert run_ros_scenarios.describe_exit(None, 0).startswith("unknown")
 
 
 def test_the_robot_has_no_plain_twist_input_and_the_node_publishes_none():
