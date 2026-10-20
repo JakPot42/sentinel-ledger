@@ -453,6 +453,33 @@ def test_twist_stamped_and_a_robot_that_does_not_move_are_in_the_journal_as_odom
     assert all(f["measured"]["linear_x_mm_s"] == 0 and f["measured"]["angular_z_mrad_s"] == 0 for f in reports)
 
 
+def test_on_a_simulation_slower_than_real_time_the_reading_waits_for_its_own_clock(ros_node, tmp_path):
+    """A stand-in whose clock runs at 0.6 of real time. With /clock there, the runner has the
+    bridge wait for one second of the simulation's time before each reading, about 1.67 s
+    of wall time; told to use the wall clock, it reads after one wall second, 0.6 s of the
+    robot's time. The feedback reports themselves are the same kind either way (SPEC 4.6)."""
+    for clock, low, high in (("sim", 1550, 2600), ("wall", 950, 1450)):
+        done, run, records, verified = run_on_sim(ros_node, tmp_path / clock, "--clock-rate 0.6",
+                                                  "--read-clock", clock)
+        assert done.returncode == 0, done.stdout[-3000:] + done.stderr[-3000:]
+        assert verified["findings"] == []
+        reports = [r["feedback"] for r in records if r["kind"] == "actuator_feedback"]
+        assert len(reports) == 5
+        assert all(low <= f["after_ms"] <= high for f in reports), (clock, [f["after_ms"] for f in reports])
+        with open(os.path.join(run, "SUMMARY.md"), encoding="utf-8") as fh:
+            summary = fh.read()
+        rate = float(re.search(r"simulated time ran at ([0-9.]+) of real time", summary).group(1))
+        assert 0.45 <= rate <= 0.7, rate
+        simulated = [float(x) for x in re.findall(r"\(([0-9.]+) s simulated\)", summary)]
+        assert len(simulated) == 5
+        if clock == "sim":
+            assert "once /clock had advanced 1 s" in summary
+            assert all(0.95 <= x <= 1.6 for x in simulated), simulated
+        else:
+            assert "on the wall clock (--read-clock wall)" in summary
+            assert all(x < 0.95 for x in simulated), simulated
+
+
 @pytest.mark.skipif(False, reason="always runs")
 def test_ros2_tests_ran_or_were_skipped_knowingly():
     """Fails nowhere. It exists so the count of skipped tests is read and not missed:

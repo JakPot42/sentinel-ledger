@@ -34,3 +34,19 @@ def pose_state(px, py, qx, qy, qz, qw):
     `state` (SPEC 4.6)."""
     return {"x_mm": int(round(px * 1000)), "y_mm": int(round(py * 1000)),
             "heading_mrad": int(round(yaw_of(qx, qy, qz, qw) * 1000))}
+
+
+def reading_due(clock, wall_now, sim_now, acted, read_after, cap):
+    """Whether the odometry reading for the action in force is due. `acted` is when the
+    action took effect: (wall-clock seconds, simulated seconds or None).
+
+    clock "wall": once the action has been in force for `read_after` seconds of wall time.
+    clock "sim": once the simulation's clock has advanced `read_after` seconds since then,
+    or after `cap` seconds of wall time, whichever comes first, so a simulation that is
+    paused or stalled is still read. Where there is no simulated time (no /clock seen, now
+    or when the action took effect), as "wall"."""
+    acted_wall, acted_sim = acted
+    waited = wall_now - acted_wall
+    if clock == "sim" and sim_now is not None and acted_sim is not None:
+        return sim_now - acted_sim >= read_after or waited >= cap
+    return waited >= read_after

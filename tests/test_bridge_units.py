@@ -40,3 +40,29 @@ def test_the_heading_of_a_quaternion():
         assert abs(bu.yaw_of(*q) - heading) < 1e-9
     assert bu.pose_state(1.2345, -0.5, 0.0, 0.0, math.sin(0.25), math.cos(0.25)) == \
         {"x_mm": 1234, "y_mm": -500, "heading_mrad": 500}
+
+
+def test_a_reading_on_the_wall_clock_waits_for_wall_time_only():
+    assert not bu.reading_due("wall", 100.9, 50.0, (100.0, 40.0), 1.0, 5.0)
+    assert bu.reading_due("wall", 101.0, 40.1, (100.0, 40.0), 1.0, 5.0)
+
+
+def test_a_reading_on_the_simulated_clock_waits_for_simulated_time():
+    # The simulation runs at half speed: one wall second is half a simulated second.
+    assert not bu.reading_due("sim", 101.0, 40.5, (100.0, 40.0), 1.0, 5.0)
+    assert not bu.reading_due("sim", 101.9, 40.95, (100.0, 40.0), 1.0, 5.0)
+    assert bu.reading_due("sim", 102.0, 41.0, (100.0, 40.0), 1.0, 5.0)
+
+
+def test_a_simulation_that_stalls_is_read_after_the_wall_clock_cap():
+    assert not bu.reading_due("sim", 104.9, 40.2, (100.0, 40.0), 1.0, 5.0)
+    assert bu.reading_due("sim", 105.0, 40.2, (100.0, 40.0), 1.0, 5.0)
+    # A clock that goes backwards (a reset simulation) waits for the cap too.
+    assert not bu.reading_due("sim", 104.0, 3.0, (100.0, 40.0), 1.0, 5.0)
+
+
+def test_with_no_simulated_time_the_wall_clock_decides():
+    # No /clock at all, or none yet when the action took effect.
+    assert bu.reading_due("sim", 101.0, None, (100.0, None), 1.0, 5.0)
+    assert bu.reading_due("sim", 101.0, 40.1, (100.0, None), 1.0, 5.0)
+    assert not bu.reading_due("sim", 100.5, None, (100.0, None), 1.0, 5.0)

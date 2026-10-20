@@ -8,7 +8,9 @@ The recorder and its working directory are exactly as in sentinel.launch.py. In 
 the simulated robot there is ros2/sim_bridge.py, the same gate in front of the robot in
 the simulation, and the simulation itself, started from SL_SIM_COMMAND (split as a shell
 would, but not run through one). Optional: SL_SIM_CMD_TOPIC (default /cmd_vel),
-SL_SIM_CMD_TYPE (twist or twist_stamped, default twist), SL_SIM_ODOM_TOPIC (default /odom).
+SL_SIM_CMD_TYPE (twist or twist_stamped, default twist), SL_SIM_ODOM_TOPIC (default /odom),
+SL_SIM_READ_CLOCK (wall or sim, default wall: the clock the bridge times its odometry
+reading on).
 
 When the bridge exits, which it does when the run is over, everything is shut down,
 the simulation included.
@@ -56,7 +58,8 @@ def generate_launch_description():
              "--exit-file", os.path.join(work, "robot.exit"),
              "--cmd-topic", os.environ.get("SL_SIM_CMD_TOPIC", "/cmd_vel"),
              "--cmd-type", os.environ.get("SL_SIM_CMD_TYPE", "twist"),
-             "--odom-topic", os.environ.get("SL_SIM_ODOM_TOPIC", "/odom")] + gate,
+             "--odom-topic", os.environ.get("SL_SIM_ODOM_TOPIC", "/odom"),
+             "--read-clock", os.environ.get("SL_SIM_READ_CLOCK", "wall")] + gate,
         output="screen")
     # A simulator can take well over launch's default 5 seconds to stop after SIGINT
     # (Gazebo does); without the longer wait it is left running when the launch ends.

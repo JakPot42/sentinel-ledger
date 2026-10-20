@@ -5,9 +5,9 @@ verifier's report.
 
     . /opt/ros/lyrical/setup.sh
     python3 ros2/run_on_your_sim.py --node /path/to/sentinel_recorder_node \
-        --sim "ros2 launch turtlebot3_gazebo empty_world.launch.py" --env TURTLEBOT3_MODEL=burger \
+        --sim "ros2 launch ros2/examples/turtlebot3_headless.launch.py" --env TURTLEBOT3_MODEL=burger \
         [--cmd-topic /cmd_vel] [--cmd-type twist|twist_stamped] [--odom-topic /odom] \
-        [--speed 0.2] [--turn 0.5] [--out DIR]
+        [--speed 0.2] [--turn 0.5] [--settle 3] [--read-clock sim|wall] [--out DIR]
 
 What runs (ros2/launch/sentinel_on_sim.launch.py): your simulation, started by the
 command given with --sim; the recorder node, as everywhere else in this repository; and
@@ -19,9 +19,11 @@ curtain interrupted (the ruleset blocks it, so the robot is given its safe state
 forward more slowly, stop. Each command becomes a signed record, the gate checks each
 record before your robot is given anything, signs a receipt for what it did, and after
 each command reads your robot's odometry and signs that as the actuator's feedback. All
-of it goes into the journal. If the simulation publishes /clock, SUMMARY.md says how fast
-simulated time ran against the wall clock. When the run is over, anything of the
-simulation's still running is stopped.
+of it goes into the journal. If the simulation publishes /clock, the bridge waits for one
+second of the simulation's own time before each reading (--read-clock sim, the default
+here; at most five seconds of wall time), and SUMMARY.md says how fast simulated time ran
+against the wall clock and how much of it passed before each reading. When the run is
+over, anything of the simulation's still running is stopped.
 
 What you get, in the run's folder (printed at the end):
   data/logchain.journal   the journal: every record, numbered, chained and signed
@@ -67,22 +69,25 @@ class SimSession(base.Session):
     """A session whose robot is someone else's simulation, behind ros2/sim_bridge.py."""
 
     def __init__(self, out, name, node_bin, sim_command, cmd_topic, cmd_type, odom_topic, env, start_timeout,
-                 settle=3.0):
+                 settle=3.0, read_clock="sim"):
         super().__init__(out, name, node_bin)
         self.launch_file = LAUNCH
         self.odom_topic, self.start_timeout, self.settle = odom_topic, start_timeout, settle
         self.left_running = False
         self.extra_env = dict(env, SL_SIM_COMMAND=sim_command, SL_SIM_CMD_TOPIC=cmd_topic,
-                              SL_SIM_CMD_TYPE=cmd_type, SL_SIM_ODOM_TOPIC=odom_topic)
+                              SL_SIM_CMD_TYPE=cmd_type, SL_SIM_ODOM_TOPIC=odom_topic,
+                              SL_SIM_READ_CLOCK=read_clock)
 
     def launch(self):
         started = super().launch()
         self.odometry, self.clock = [], []
         self.node.create_subscription(Odometry, self.odom_topic, self.odometry.append, 10)
         # The simulation's own clock, if it publishes one, against the wall clock: how fast
-        # simulated time ran while the commands were sent.
+        # simulated time ran while the commands were sent, and how much of it passed before
+        # each reading. Each sample: (monotonic, wall clock, simulated), in seconds.
         self.node.create_subscription(
-            Clock, "/clock", lambda m: self.clock.append((time.monotonic(), m.clock.sec + m.clock.nanosec / 1e9)), 10)
+            Clock, "/clock", lambda m: self.clock.append(
+                (time.monotonic(), time.time(), m.clock.sec + m.clock.nanosec / 1e9)), 10)
         # A simulator can take a minute or more to load a world; nothing is commanded before
         # the robot is publishing odometry.
         self.wait(lambda: len(self.odometry) >= 1, self.start_timeout, "odometry on " + self.odom_topic)
@@ -112,7 +117,17 @@ class SimSession(base.Session):
         seen = [c for c in self.clock if c[0] >= since]
         if len(seen) < 2 or seen[-1][0] - seen[0][0] <= 0:
             return None
-        return (seen[-1][1] - seen[0][1]) / (seen[-1][0] - seen[0][0])
+        return (seen[-1][2] - seen[0][2]) / (seen[-1][0] - seen[0][0])
+
+    def sim_at(self, wall):
+        """The simulation's time at wall-clock time `wall` (seconds since the epoch), from the
+        /clock samples either side of it; None outside them."""
+        before = [c for c in self.clock if c[1] <= wall]
+        after = [c for c in self.clock if c[1] >= wall]
+        if not before or not after:
+            return None
+        (_, w0, s0), (_, w1, s1) = before[-1], after[0]
+        return s0 if w1 == w0 else s0 + (s1 - s0) * (wall - w0) / (w1 - w0)
 
 
 def group_alive(pgid):
@@ -156,12 +171,18 @@ def rows(s):
             continue
         receipt, report = receipts.get(r["n"], {}), feedback.get(r["n"], {})
         measured = report.get("measured") or {}
+        sim_after = None
+        if report.get("at_ms") is not None and report.get("after_ms") is not None:
+            acted = s.sim_at((report["at_ms"] - report["after_ms"]) / 1000.0)
+            read = s.sim_at(report["at_ms"] / 1000.0)
+            if acted is not None and read is not None:
+                sim_after = read - acted
         out.append({"n": r["n"], "requested": (r["requested"].get("linear_x_mm_s"), r["requested"].get("angular_z_mrad_s")),
                     "outcome": r["outcome"],
                     "receipt": receipt.get("decision", "none") + (":" + receipt["reason"] if receipt.get("reason") else ""),
                     "sent": (report.get("sent", {}).get("linear_x_mm_s"), report.get("sent", {}).get("angular_z_mrad_s")),
                     "measured": (measured.get("linear_x_mm_s"), measured.get("angular_z_mrad_s")),
-                    "after_ms": report.get("after_ms")})
+                    "after_ms": report.get("after_ms"), "sim_after": sim_after})
     return out
 
 
@@ -179,11 +200,16 @@ def export_and_check(s, root):
 def write_summary(s, args, table, verified, exits, export_code, rtf=None):
     code, report = verified
     if rtf is None:
-        pace = "The simulation published no /clock, so how fast its time ran was not measured."
+        pace = ("The simulation published no /clock, so how fast its time ran was not measured, and "
+                "the bridge timed each odometry reading on the wall clock.")
+    elif args.read_clock == "sim":
+        pace = ("While the commands were sent, simulated time ran at %.2f of real time (from /clock). "
+                "The bridge took each odometry reading once /clock had advanced 1 s since the action, "
+                "or after 5 s of wall time if it had not." % rtf)
     else:
         pace = ("While the commands were sent, simulated time ran at %.2f of real time (from /clock). "
-                "The bridge times its odometry reading on the wall clock, so its 1 s wait was about "
-                "%.2f s of simulated time." % (rtf, rtf))
+                "The bridge timed its odometry reading on the wall clock (--read-clock wall), so its "
+                "1 s wait was about %.2f s of simulated time." % (rtf, rtf))
     lines = ["# A signed log on a simulated robot", "",
              "Simulation: `%s`" % args.sim, "",
              "Command topic `%s` (%s), odometry `%s`." % (args.cmd_topic, args.cmd_type, args.odom_topic), "",
@@ -192,8 +218,11 @@ def write_summary(s, args, table, verified, exits, export_code, rtf=None):
              "| the robot was given | odometry measured, and how long after |",
              "|---|---|---|---|---|---|"]
     for row in table:
-        lines.append("| %d | %s | %s | %s | %s | %s, %s ms |" % (
-            row["n"], row["requested"], row["outcome"], row["receipt"], row["sent"], row["measured"], row["after_ms"]))
+        after = "%s ms" % row["after_ms"]
+        if row["sim_after"] is not None:
+            after += " (%.2f s simulated)" % row["sim_after"]
+        lines.append("| %d | %s | %s | %s | %s | %s, %s |" % (
+            row["n"], row["requested"], row["outcome"], row["receipt"], row["sent"], row["measured"], after))
     lines += ["",
               "Recorder exit %s, bridge exit %s (0: the gate refused nothing)." % exits,
               "Verifier exit %s, findings: %s." % (code, ", ".join(kinds(report)) or "none"),
@@ -222,6 +251,9 @@ def main(argv=None):
     ap.add_argument("--start-timeout", type=float, default=180, help="seconds to wait for the first odometry")
     ap.add_argument("--settle", type=float, default=3.0,
                     help="seconds to wait after the first odometry before the first command (default 3)")
+    ap.add_argument("--read-clock", choices=("sim", "wall"), default="sim",
+                    help="time the wait before each odometry reading on the simulation's /clock where it "
+                         "publishes one (sim, the default) or on the wall clock (wall)")
     ap.add_argument("--out", default=os.path.join(HERE, "out", "your_sim"))
     args = ap.parse_args(argv)
     env = {}
@@ -233,7 +265,7 @@ def main(argv=None):
 
     rclpy.init()
     s = SimSession(os.path.abspath(args.out), "run", os.path.abspath(args.node), args.sim, args.cmd_topic,
-                   args.cmd_type, args.odom_topic, env, args.start_timeout, args.settle)
+                   args.cmd_type, args.odom_topic, env, args.start_timeout, args.settle, args.read_clock)
     try:
         s.launch()
         began = time.monotonic()
