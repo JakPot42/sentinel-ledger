@@ -77,6 +77,15 @@ second verifier from it without reading the code.
 
 Read these before relying on anything above.
 
+Sentinel Ledger records and checks signed evidence about commands, gate decisions and
+actuator feedback. The gate, the recorder and the controller's feedback key all run on the
+same computer, so anyone who controls that computer below the operating system, or
+controls the controller's firmware, could bypass the gate and sign false records. Sentinel
+Ledger therefore gives tamper evidence against weaker adversaries, not protection against
+a compromised host. It is not safety-rated, has not been assessed against any standard,
+and does not replace safety-rated controllers, emergency stops or risk assessment. It has
+been tested in simulation only.
+
 - **The gate cannot see whether a record reached the disk.** With this recorder, one
   unrecorded command can pass before the gap shows: the recorder stops at the first failed
   write, and when it restarts the gate refuses it. It would be wrong to say "never more
